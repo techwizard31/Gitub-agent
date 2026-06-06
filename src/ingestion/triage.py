@@ -60,7 +60,7 @@ class IssueTriageEngine:
         title = issue_data.get("title", "")
         body = issue_data.get("body", "") or "No body provided."
         
-        print(f"🤖 Analyzing context structural telemetry with Gemini 3.1 Pro..")
+        print(f"🤖 Analyzing issue with Gemini 2.5 Pro (structured triage)...")
         
         prompt = f"""
         You are an elite triage engineer. Analyze the following open-source GitHub issue description and structure its operational goals.
@@ -71,8 +71,9 @@ class IssueTriageEngine:
         """
 
         # Enforce structured output generation using Pydantic models
+        # gemini-2.5-pro: best-in-class reasoning for complex structured JSON triage
         response = self.client.models.generate_content(
-            model="gemini-3.1-pro-preview",
+            model="gemini-2.5-pro",
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
