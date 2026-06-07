@@ -92,8 +92,10 @@ class GitHubClient:
         while time.time() < deadline:
             try:
                 data = self._request("GET", "/repos/" + username + "/" + repo)
-                # Once the repo reports a default_branch and is not empty, it's ready
-                if data.get("default_branch") and not data.get("empty_repo", True):
+                # GitHub forks are ready once they have a default_branch populated.
+                # The `empty_repo` field does NOT exist in the API response — checking
+                # for default_branch presence alone is the correct signal.
+                if data.get("default_branch"):
                     print("✅ Fork is ready.")
                     return True
             except RuntimeError:
