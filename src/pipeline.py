@@ -20,19 +20,12 @@ from github_client import GitHubClient
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 class FilePatch(BaseModel):
-    """
-    A single atomic file change — one entry in a multi-file patch set.
-    A hypothesis can contain as many FilePatch entries as the fix requires.
-    """
+    """One atomic file change — one entry in a multi-file patch set."""
     target_file: str = Field(
         description="Relative path of the file to modify (must exist in the repo)."
     )
-    start_line: int = Field(
-        description="First line of the region to operate on."
-    )
-    end_line: int = Field(
-        description="Last line of the region to operate on."
-    )
+    start_line: int = Field(description="First line of the region to operate on.")
+    end_line: int = Field(description="Last line of the region to operate on.")
     patch_mode: str = Field(
         default="replace",
         description=(
@@ -48,25 +41,19 @@ class FilePatch(BaseModel):
     new_code: str = Field(
         description=(
             "The Go source code to write. "
-            "For 'replace': the complete replacement for start_line..end_line. "
+            "For 'replace': complete replacement for start_line..end_line. "
             "For 'insert_after': only the new lines to insert — do not repeat existing lines."
         )
     )
 
 
 class FixHypothesis(BaseModel):
-    """
-    One complete fix strategy, potentially spanning multiple files.
-    All patches in the list are applied in order to the same worktree.
-    """
-    title: str = Field(
-        description="Short descriptive title of this fix approach."
-    )
+    """One complete fix strategy, potentially spanning multiple files."""
+    title: str = Field(description="Short descriptive title of this fix approach.")
     patches: list[FilePatch] = Field(
         description=(
             "Ordered list of file changes that together implement this fix. "
-            "Include ALL files that need to change — e.g. both the function definition file "
-            "AND the registration map file. There is no limit on the number of patches."
+            "Include ALL files that need to change. No limit on patch count."
         )
     )
 
@@ -82,9 +69,9 @@ class StrategyBlueprint(BaseModel):
 def clean_llm_code_output(raw_text: str) -> str:
     """Strips markdown fences, conflict markers, and diff markers from LLM output."""
     text = raw_text.strip()
-    code_block_match = re.search(r"```(?:go)?\s*\n(.*?)```", text, re.DOTALL)
-    if code_block_match:
-        text = code_block_match.group(1).strip()
+    m = re.search(r"```(?:go)?\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
     text = re.compile(r"^(<{7}|={7}|>{7}).*$", re.MULTILINE).sub("", text).strip()
     text = re.compile(r"^[+-]{3}\s+.*$", re.MULTILINE).sub("", text).strip()
     return text
@@ -92,22 +79,20 @@ def clean_llm_code_output(raw_text: str) -> str:
 
 def extract_error_line(error_text: str) -> int | None:
     """Extracts first error line number from gofmt/go vet output."""
-    match = re.search(r":(\d+):\d+:", error_text)
-    return int(match.group(1)) if match else None
+    m = re.search(r":(\d+):\d+:", error_text)
+    return int(m.group(1)) if m else None
+
+
+def extract_error_file(error_text: str) -> str | None:
+    """Extracts the filename from a gofmt/go vet error line."""
+    m = re.search(r"([\w./\\-]+\.go):(\d+):\d+:", error_text)
+    return m.group(1) if m else None
 
 
 def make_branch_name(issue_number, track_id: str, cycle: int, run_ts: int) -> str:
     """
-    Generates a globally unique branch name that encodes:
-      - issue number  → different issues never share a branch
-      - track id      → ALPHA vs BETA always distinct
-      - cycle         → Cycle 1 vs Cycle 2 retry never clash
-      - run_ts        → Unix timestamp at pipeline start, unique per re-run
-
-    Pattern: sentinel/issue-{N}/{track}-c{cycle}-{ts}
-    Example: sentinel/issue-1543/track-alpha-c1-1749123456
-
-    Re-running the same issue produces a different timestamp → zero collision.
+    Globally unique branch name: sentinel/issue-{N}/{track}-c{cycle}-{ts}
+    run_ts is fixed at pipeline start so re-running always gets a new timestamp.
     """
     issue_slug = "issue-" + str(issue_number) + "/" if issue_number else ""
     track_slug = re.sub(r"[^a-zA-Z0-9]", "-", track_id.lower())
@@ -115,10 +100,7 @@ def make_branch_name(issue_number, track_id: str, cycle: int, run_ts: int) -> st
 
 
 def _build_file_inventory(repo_path: str) -> str:
-    """
-    Returns a compact list of all real .go source files in the repo with line counts.
-    Gives the planner ground-truth paths so it never hallucinates file names.
-    """
+    """Real .go source files with line counts — ground truth for the planner."""
     entries = []
     for root, dirs, files in os.walk(repo_path):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("vendor", "testdata")]
@@ -129,8 +111,8 @@ def _build_file_inventory(repo_path: str) -> str:
             rel  = os.path.relpath(full, repo_path).replace(os.sep, "/")
             try:
                 with open(full, encoding="utf-8", errors="ignore") as f:
-                    lc = sum(1 for _ in f)
-                entries.append(rel + "  (" + str(lc) + " lines)")
+                    lines = sum(1 for _ in f)
+                entries.append(rel + "  (" + str(lines) + " lines)")
             except OSError:
                 pass
     if not entries:
@@ -141,11 +123,7 @@ def _build_file_inventory(repo_path: str) -> str:
 
 
 def _validate_and_correct_patches(patches: list[dict], repo_path: str) -> list[dict]:
-    """
-    For each patch, verify target_file exists in the repo.
-    If not, attempt to find the closest real file by basename match.
-    Drops patches that cannot be resolved.
-    """
+    """Verify each patch's target_file exists. Attempt basename match for hallucinated paths."""
     good = []
     for p in patches:
         target = p.get("target_file", "")
@@ -153,7 +131,6 @@ def _validate_and_correct_patches(patches: list[dict], repo_path: str) -> list[d
         if os.path.isfile(full):
             good.append(p)
             continue
-        # Try basename match
         base = os.path.basename(target)
         found = False
         for root, _, files in os.walk(repo_path):
@@ -161,8 +138,7 @@ def _validate_and_correct_patches(patches: list[dict], repo_path: str) -> list[d
                 real_rel = os.path.relpath(
                     os.path.join(root, base), repo_path
                 ).replace(os.sep, "/")
-                print("   ↳ Correcting hallucinated path '" + target
-                      + "' → '" + real_rel + "'")
+                print("   ↳ Correcting path '" + target + "' → '" + real_rel + "'")
                 p["target_file"] = real_rel
                 good.append(p)
                 found = True
@@ -170,6 +146,179 @@ def _validate_and_correct_patches(patches: list[dict], repo_path: str) -> list[d
         if not found:
             print("   ↳ Dropping patch — file not found: '" + target + "'")
     return good
+
+
+def _find_nearest_pattern(file_content_lines: list, error_line: int, target_call: str) -> str:
+    """
+    Scans backwards from error_line to find the nearest block of lines containing
+    target_call. Returns those lines with line numbers. This finds the actual
+    existing usage pattern rather than random preceding code.
+
+    For example, if target_call is "ut.Add" it finds the nearest previous ut.Add(...)
+    block — showing the LLM exactly what syntax to follow.
+    """
+    if not target_call:
+        # Fall back to raw preceding lines
+        start = max(0, error_line - 15)
+        end   = max(0, error_line - 1)
+        return "".join(
+            str(i + 1) + " | " + file_content_lines[i]
+            for i in range(start, end)
+        )
+
+    # Scan backwards for the nearest block containing target_call
+    search_from = min(error_line - 1, len(file_content_lines) - 1)
+    block_end   = -1
+    for i in range(search_from, max(0, search_from - 80), -1):
+        if target_call in file_content_lines[i]:
+            block_end = i
+            break
+
+    if block_end == -1:
+        # target_call not found — return raw preceding lines
+        start = max(0, error_line - 12)
+        return "".join(
+            str(i + 1) + " | " + file_content_lines[i]
+            for i in range(start, error_line - 1)
+        )
+
+    # Return the block from block_end - 2 to block_end + 2 for context
+    start = max(0, block_end - 2)
+    end   = min(len(file_content_lines), block_end + 3)
+    return "".join(
+        str(i + 1) + " | " + file_content_lines[i]
+        for i in range(start, end)
+    )
+
+
+def _detect_call_pattern(file_path: str) -> str:
+    """
+    Detects the dominant function-call pattern in a file so the pattern finder
+    can look for the right thing. Handles common Go patterns:
+      - translations files: "ut.Add("
+      - registration maps:  "bakedInValidators[" or just the map key pattern
+      - validator funcs:    "func is" or "func has"
+    """
+    fname = os.path.basename(file_path).lower()
+    path_lower = file_path.lower()
+    if "translat" in path_lower or fname in ("en.go", "zh.go", "fr.go", "de.go"):
+        return "ut.Add("
+    if "baked_in" in fname:
+        return "bakedInValidators["
+    if "regexes" in fname:
+        return "= regexp.MustCompile("
+    return ""
+
+
+def _analyze_error(error_log: str, patch: "FilePatch", aci: "AgentComputerInterface") -> dict:
+    """
+    Converts a raw compiler/gofmt error into a structured analysis dict with:
+      - error_type:   'syntax' | 'undefined' | 'type' | 'other'
+      - error_msg:    single clean line describing what is wrong (no file/line prefix)
+      - error_line:   integer line number or None
+      - pattern:      nearest SAME-CALL-PATTERN block before the error line
+                      (not random preceding lines — the actual call pattern to follow)
+      - instruction:  one short surgical sentence: what to fix and how
+
+    Design rules:
+    - Never include raw error text in the instruction — classify it first
+    - Pattern is always the nearest identical call pattern, not arbitrary context
+    - Instruction is max 2 sentences — anything longer increases hallucination risk
+    """
+    error_line = extract_error_line(error_log)
+
+    # ── Classify ────────────────────────────────────────────────────────────
+    undef_name = ""
+    if "missing import" in error_log or "missing ',' in argument" in error_log:
+        error_type = "import"
+    elif "SYNTAX FAIL" in error_log or "expected" in error_log or "illegal" in error_log:
+        error_type = "syntax"
+    elif "undefined:" in error_log:
+        error_type = "undefined"
+        m = re.search(r"undefined:\s*(\S+)", error_log)
+        undef_name = m.group(1) if m else "unknown"
+    elif "cannot use" in error_log or "type mismatch" in error_log or "cannot convert" in error_log:
+        error_type = "type"
+    else:
+        error_type = "other"
+
+    # ── Clean error message — strip file:line: prefix noise ─────────────────
+    first_meaningful = ""
+    for raw_line in error_log.strip().split("\n"):
+        m = re.search(r":\d+:\d+:\s*(.+)$", raw_line)
+        if m:
+            first_meaningful = m.group(1).strip()
+            break
+    if not first_meaningful:
+        first_meaningful = error_log.strip().split("\n")[0][:100]
+
+    # ── Find the nearest same-call pattern before the error ─────────────────
+    # Read the actual file lines so we can scan them directly
+    try:
+        safe_path = aci._resolve_safe_path(patch.target_file)
+        with open(safe_path, encoding="utf-8", errors="ignore") as f:
+            file_lines = f.readlines()
+    except Exception:
+        file_lines = []
+
+    anchor_line = error_line or patch.end_line
+    call_pattern = _detect_call_pattern(patch.target_file)
+
+    if file_lines and anchor_line:
+        pattern = _find_nearest_pattern(file_lines, anchor_line, call_pattern)
+    elif patch.start_line > 5:
+        pattern = aci.view_file_range(
+            patch.target_file,
+            max(1, patch.start_line - 12),
+            patch.start_line - 1,
+        )
+    else:
+        pattern = ""
+
+    # ── Build surgical instruction ───────────────────────────────────────────
+    if error_type == "import":
+        instruction = (
+            "Your output included a package declaration or import block. "
+            "Output ONLY the function/method body lines for the target range. "
+            "NEVER output 'package X', 'import (...)', or file headers — "
+            "those already exist in the file. Adding them again breaks the syntax."
+        )
+    elif error_type == "syntax":
+        if call_pattern == "ut.Add(":
+            instruction = (
+                "Syntax error in translation call. "
+                "Use the EXACT same ut.Add(...) call signature as the pattern below — "
+                "same argument count, same string quoting style, same {0} placeholder format."
+            )
+        else:
+            instruction = (
+                "Syntax error: '" + first_meaningful + "'. "
+                "Match the call syntax in the PATTERN below exactly — "
+                "same delimiters, same argument format, same indentation."
+            )
+    elif error_type == "undefined":
+        instruction = (
+            "'" + undef_name + "' is not defined. "
+            "Use a name that already exists in the file or define it in this patch."
+        )
+    elif error_type == "type":
+        instruction = (
+            "Type mismatch. "
+            "Check the PATTERN below for the correct type used in this call."
+        )
+    else:
+        instruction = (
+            "Error: '" + first_meaningful + "'. "
+            "Match the PATTERN below exactly."
+        )
+
+    return {
+        "error_type":  error_type,
+        "error_msg":   first_meaningful,
+        "error_line":  error_line,
+        "pattern":     pattern,
+        "instruction": instruction,
+    }
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -195,7 +344,7 @@ class SentinelPipeline:
         self.upstream_owner = upstream_owner
         self.fork_username  = fork_username
         self._issue_number: int | None = None
-        self._run_ts: int = int(time.time())   # fixed at pipeline start, same across all tracks
+        self._run_ts: int = int(time.time())  # fixed at start — unique per re-run
 
     # ── Branch commit + transfer ──────────────────────────────────────────────
 
@@ -207,21 +356,15 @@ class SentinelPipeline:
     ) -> bool:
         """
         Stages ALL modified files, commits, then transfers the branch to the
-        main repo so it survives worktree cleanup and can be pushed to the fork.
-
-        Transfer strategy:
-          Primary:  git fetch <normalized_path> branch:branch
-          Fallback: git branch -f <branch> <commit_hash>  (Windows compatibility)
+        main repo so it survives worktree cleanup and can be pushed.
         """
-        # Build commit message listing every file that was patched
         files_changed = "\n".join(
             "  - " + p.target_file + " (" + p.description + ")"
             for p in hypothesis.patches
         )
         commit_msg = (
             "fix: " + hypothesis.title + "\n\n"
-            "Applied by Sentinel Engine.\n"
-            "Files changed:\n" + files_changed
+            "Applied by Sentinel Engine.\nFiles changed:\n" + files_changed
         )
 
         add_res = subprocess.run(
@@ -256,11 +399,9 @@ class SentinelPipeline:
             ["git", "rev-parse", "HEAD"], cwd=wt_workspace, capture_output=True, text=True
         )
         if hash_res.returncode != 0:
-            print("  ⚠️  Could not read commit hash.")
             return False
         commit_hash = hash_res.stdout.strip()
 
-        # Primary transfer: git fetch with forward-slash path (Windows safe)
         wt_normalized = wt_workspace.replace(os.sep, "/")
         fetch_res = subprocess.run(
             ["git", "fetch", wt_normalized, branch_name + ":" + branch_name],
@@ -270,7 +411,6 @@ class SentinelPipeline:
             print("  ✅ Branch '" + branch_name + "' transferred to main repo.")
             return True
 
-        # Fallback: point branch directly at commit hash
         create_res = subprocess.run(
             ["git", "branch", "-f", branch_name, commit_hash],
             cwd=self.repo_path, capture_output=True, text=True
@@ -280,11 +420,9 @@ class SentinelPipeline:
             return True
 
         print("  ❌ Branch transfer failed.")
-        print("     fetch: " + fetch_res.stderr.strip())
-        print("     branch -f: " + create_res.stderr.strip())
         return False
 
-    # ── Self-healing prompt builder ───────────────────────────────────────────
+    # ── Heal prompt builder ───────────────────────────────────────────────────
 
     def _build_heal_prompt(
         self,
@@ -295,96 +433,60 @@ class SentinelPipeline:
         all_patches: list | None = None,
     ) -> str:
         """
-        Builds a targeted repair prompt for a single failed FilePatch.
+        Builds a SHORT, SURGICAL heal prompt.
 
-        Shows:
-        - The broken code that was actually written
-        - The exact gofmt / go vet / go test error
-        - Wide context around the error line
-        - A summary of ALL other patches in this hypothesis (cross-file context)
-          so the LLM knows what function names / identifiers other patches are using
-
-        The cross-file context is critical for errors like "undefined: isDNSLabel"
-        where the function definition patch and the registration patch must use
-        identical identifiers.
+        Design principles:
+        1. Never dump raw error text — parse it into a structured analysis first
+        2. Show the PATTERN (existing similar code) not the broken insertion point
+        3. One clear instruction: "write code exactly like the pattern, but for X"
+        4. Cross-file identity check only when relevant (undefined errors)
+        5. Keep total prompt under ~500 tokens — shorter = less hallucination
         """
-        error_line = extract_error_line(error_log)
-
-        if error_line:
-            ctx_start = max(1, error_line - 10)
-            ctx_end   = error_line + 10
-            context   = aci.view_file_range(patch.target_file, ctx_start, ctx_end)
-            ctx_label = (
-                "FILE AROUND ERROR LINE " + str(error_line)
-                + " (lines " + str(ctx_start) + "-" + str(ctx_end) + "):"
-            )
-        else:
-            ctx_start = max(1, patch.start_line - 5)
-            ctx_end   = patch.end_line + 5
-            context   = aci.view_file_range(patch.target_file, ctx_start, ctx_end)
-            ctx_label = (
-                "FILE AT TARGET RANGE (lines "
-                + str(ctx_start) + "-" + str(ctx_end) + "):"
-            )
-
-        if "SYNTAX FAIL" in error_log or "expected operand" in error_log or "gofmt" in error_log.lower():
-            guidance = (
-                "This is a Go SYNTAX error (caught by gofmt). "
-                "Check for unmatched parentheses, missing commas in struct literals, "
-                "or malformed function signatures. Count braces carefully."
-            )
-        else:
-            guidance = (
-                "This is a Go COMPILER or VET error. "
-                "Check for undefined identifiers, wrong function signatures, "
-                "type mismatches, or missing imports. "
-                "If the error says 'undefined: X', ensure your code defines or imports X "
-                "with the EXACT same name used in the other patches listed below."
-            )
+        analysis = _analyze_error(error_log, patch, aci)
 
         mode_instruction = (
-            "Insert the corrected code AFTER line " + str(patch.end_line) + ". "
+            "Insert new code AFTER line " + str(patch.end_line) + ". "
             "Do NOT reproduce existing lines."
             if patch.patch_mode == "insert_after"
             else "Replace lines " + str(patch.start_line)
-            + " to " + str(patch.end_line) + " entirely."
+            + " to " + str(patch.end_line) + "."
         )
 
-        # Build cross-file context so the LLM knows what names other patches use
-        cross_file_ctx = ""
-        if all_patches and len(all_patches) > 1:
-            other_patches = [p for p in all_patches if p.target_file != patch.target_file
-                             or p.description != patch.description]
-            if other_patches:
-                cross_file_ctx = (
-                    "\nOTHER PATCHES IN THIS HYPOTHESIS (identifiers must match exactly):\n"
-                    + "\n".join(
-                        "  - " + p.target_file + ": " + p.description
-                        for p in other_patches
-                    )
-                    + "\nEnsure any function names, type names, or variable names you define "
-                    "in THIS patch are spelled exactly as referenced in the patches above.\n"
+        # Cross-file identifiers — only include for 'undefined' errors
+        cross_ctx = ""
+        if analysis["error_type"] == "undefined" and all_patches and len(all_patches) > 1:
+            others = [
+                "  - " + p.target_file + ": " + p.description
+                for p in all_patches
+                if p.description != patch.description
+            ]
+            if others:
+                cross_ctx = (
+                    "\nOTHER PATCHES (use EXACT same identifier names):\n"
+                    + "\n".join(others) + "\n"
                 )
 
         return (
-            "You are a Go compiler expert correcting a failed patch.\n\n"
+            "Go patch correction. Output ONLY raw Go code.\n\n"
             "FILE: " + patch.target_file + "\n"
-            "PATCH DESCRIPTION: " + patch.description + "\n"
-            "PATCH MODE: " + patch.patch_mode + "\n"
-            "TARGET LINES: " + str(patch.start_line) + " to " + str(patch.end_line) + "\n\n"
-            "YOUR PREVIOUS BROKEN CODE:\n" + bad_code + "\n\n"
-            "ERROR RECEIVED:\n" + error_log.strip() + "\n\n"
-            "ERROR TYPE GUIDANCE: " + guidance + "\n"
-            + cross_file_ctx + "\n"
-            + ctx_label + "\n" + context + "\n\n"
-            "TASK: " + mode_instruction + "\n\n"
-            "OUTPUT RULES:\n"
-            "- Raw Go source code ONLY. No markdown, no explanations.\n"
-            "- Match indentation exactly as shown in context.\n"
-            "- Must pass gofmt and go vet with zero errors."
+            "TASK: " + patch.description + "\n"
+            "MODE: " + patch.patch_mode
+            + " | TARGET: lines " + str(patch.start_line)
+            + "-" + str(patch.end_line) + "\n\n"
+            + cross_ctx
+            + "WHAT TO FIX: " + analysis["instruction"] + "\n\n"
+            "CORRECT PATTERN IN THIS FILE:\n"
+            + analysis["pattern"] + "\n\n"
+            "YOUR BROKEN CODE:\n"
+            + bad_code + "\n\n"
+            "STRICT RULES:\n"
+            "- Output ONLY the replacement lines. No package declarations.\n"
+            "- NEVER output import blocks or file headers — they already exist.\n"
+            "- Match indentation from the pattern above exactly.\n"
+            "Raw Go only. No markdown. No explanation."
         )
 
-    # ── Core track executor ───────────────────────────────────────────────────
+    # ── Single patch applier ──────────────────────────────────────────────────
 
     async def _apply_single_patch(
         self,
@@ -396,8 +498,8 @@ class SentinelPipeline:
         all_patches: list | None = None,
     ) -> tuple[bool, str, str]:
         """
-        Generates and applies a single FilePatch.
-        Returns (success: bool, patch_result_msg: str, code_written: str).
+        Generates and applies one FilePatch.
+        Returns (success, result_message, code_written).
         """
         current_code = aci.view_file_range(
             patch.target_file,
@@ -405,23 +507,15 @@ class SentinelPipeline:
             patch.end_line + 5,
         )
 
-        # ── Code generation ──────────────────────────────────────────────────
         if not retry_error_log:
-            if patch.patch_mode == "insert_after":
-                task = (
-                    "PATCH MODE: INSERT\n"
-                    "Insert NEW code AFTER line " + str(patch.end_line) + ".\n"
-                    "Do NOT reproduce or modify existing lines.\n"
-                    "Output ONLY the new lines to insert."
-                )
-            else:
-                task = (
-                    "PATCH MODE: REPLACE\n"
-                    "Write the COMPLETE replacement for lines "
-                    + str(patch.start_line) + " to " + str(patch.end_line) + ".\n"
-                    "Your output replaces those lines entirely."
-                )
-
+            # Cycle 1: fresh generation
+            task = (
+                "PATCH MODE: INSERT — insert NEW code AFTER line "
+                + str(patch.end_line) + ". Do NOT reproduce existing lines."
+                if patch.patch_mode == "insert_after"
+                else "PATCH MODE: REPLACE — write the complete replacement for lines "
+                + str(patch.start_line) + " to " + str(patch.end_line) + "."
+            )
             prompt = (
                 "You are a Principal Go Software Engineer.\n\n"
                 "TASK: " + patch.description + "\n"
@@ -429,12 +523,15 @@ class SentinelPipeline:
                 "TARGET LINES: " + str(patch.start_line) + "-" + str(patch.end_line) + "\n\n"
                 "CURRENT CODE AT TARGET LOCATION:\n" + current_code + "\n\n"
                 + task + "\n\n"
-                "RULES:\n"
-                "- Output ONLY raw Go source code. No markdown fences, no explanations.\n"
-                "- Preserve exact indentation from the context above.\n"
-                "- Must pass gofmt, go vet, and go test."
+                "STRICT RULES:\n"
+                "- Output ONLY the code for the target lines. Nothing else.\n"
+                "- NEVER output package declarations, import blocks, or file headers.\n"
+                "  Those already exist in the file. Adding them again corrupts the file.\n"
+                "- Preserve exact indentation from the context shown above.\n"
+                "- Output must pass gofmt with zero errors."
             )
         else:
+            # Cycle 2: structured self-healing
             prompt = self._build_heal_prompt(
                 patch=patch,
                 bad_code=retry_bad_code,
@@ -448,7 +545,6 @@ class SentinelPipeline:
         )
         code_written = clean_llm_code_output(gen_res.text)
 
-        # ── Apply ────────────────────────────────────────────────────────────
         if patch.patch_mode == "insert_after":
             result = aci.insert_after_line(patch.target_file, patch.end_line, code_written)
         else:
@@ -459,6 +555,8 @@ class SentinelPipeline:
         success = "⚠️" not in result
         return success, result, code_written
 
+    # ── Core track executor ───────────────────────────────────────────────────
+
     async def execute_hypothesis_track(
         self,
         track_id: str,
@@ -467,41 +565,40 @@ class SentinelPipeline:
     ) -> dict:
         """
         Runs one complete hypothesis track:
-        1. Creates an isolated Git Worktree on a collision-free branch
-        2. Applies ALL patches in hypothesis.patches sequentially to that worktree
-        3. Runs go vet + go test across the entire worktree
-        4. If all pass: commits every changed file and transfers branch to main repo
-        5. Returns result dict with pass/fail + per-patch diagnostics
+        1. Fresh Git Worktree on a collision-free branch
+        2. Apply ALL patches sequentially (continue even if one fails — collect all bad_codes)
+        3. go vet + go test across the entire worktree
+        4. If all pass: commit every changed file and transfer branch to main repo
 
-        retry_context (Cycle 2) is a dict with:
-          - error_log: diagnostics string from Cycle 1
-          - bad_codes: dict mapping patch index → the broken code from Cycle 1
+        retry_context (Cycle 2):
+          - error_log:  full diagnostics from Cycle 1 (go vet / gofmt)
+          - bad_codes:  dict[patch_index → broken code written in Cycle 1]
         """
         cycle       = 2 if retry_context else 1
         branch_name = make_branch_name(self._issue_number, track_id, cycle, self._run_ts)
 
-        wt_manager  = WorktreeManager(self.repo_path)
+        wt_manager   = WorktreeManager(self.repo_path)
         wt_workspace = None
 
         try:
             wt_workspace = wt_manager.create_hypothesis_worktree(track_id, branch_name)
             aci = AgentComputerInterface(base_workspace_path=wt_workspace)
 
-            # ── Apply all patches sequentially ────────────────────────────────
             all_patch_success = True
             first_failure_msg = ""
-            bad_codes: dict[int, str] = {}   # index → code written, for Cycle 2
+            bad_codes: dict[int, str] = {}
 
             for idx, patch in enumerate(hypothesis.patches):
-                label = "[" + track_id + "][patch " + str(idx + 1) + "/" + str(len(hypothesis.patches)) + "]"
+                label = (
+                    "[" + track_id + "][patch "
+                    + str(idx + 1) + "/" + str(len(hypothesis.patches)) + "]"
+                )
                 print("📝 " + label + " Applying (" + patch.patch_mode + ") → " + patch.target_file)
 
-                retry_bad  = (retry_context or {}).get("bad_codes", {}).get(idx, "")
-                # Pass the full error log to EVERY patch in Cycle 2 — not just patch 0.
-                # A go vet error like "undefined: isDNSLabel" is caused by a bad function
-                # definition (patch 0) but surfaces when compiling the registration (patch 1).
-                # Every patch needs the full diagnostic context to self-heal correctly.
-                retry_err  = (retry_context or {}).get("error_log", "")
+                # Every patch gets the full error log in Cycle 2 —
+                # cross-patch errors (undefined: X) require all patches to see the same diagnostic
+                retry_bad = (retry_context or {}).get("bad_codes", {}).get(idx, "")
+                retry_err = (retry_context or {}).get("error_log", "")
 
                 ok, msg, code = await self._apply_single_patch(
                     patch, aci, track_id,
@@ -513,54 +610,46 @@ class SentinelPipeline:
 
                 if not ok:
                     print("  ⚠️  Patch " + str(idx + 1) + " failed: " + msg[:120])
-                    if all_patch_success:  # capture only the first failure message
+                    if all_patch_success:
                         first_failure_msg = msg
                     all_patch_success = False
-                    # Do NOT break — continue applying remaining patches.
-                    # Even if patch N fails, patch N+1 may succeed independently
-                    # and all bad_codes need to be collected for Cycle 2 self-healing.
+                    # Do NOT break — keep applying remaining patches so all bad_codes
+                    # are collected, enabling full Cycle 2 self-healing context
 
             if not all_patch_success:
                 return {
-                    "track_id":   track_id,
-                    "passed":     False,
+                    "track_id":    track_id,
+                    "passed":      False,
                     "diagnostics": first_failure_msg,
-                    "bad_codes":  bad_codes,
-                    "branch":     branch_name,
-                    "hypothesis": hypothesis,
+                    "bad_codes":   bad_codes,
+                    "branch":      branch_name,
+                    "hypothesis":  hypothesis,
                 }
 
-            # ── Verify the whole worktree ─────────────────────────────────────
             tester     = AsyncTestSuiteRunner(wt_workspace)
             matrix_res = await tester.execute_verification_matrix(track_id)
 
             if matrix_res["passed"]:
                 self._commit_and_transfer_branch(wt_workspace, branch_name, hypothesis)
             else:
-                # CRITICAL: overwrite first_failure_msg with the real go vet/test output.
-                # Patch-level gofmt errors only affect one patch and are already in
-                # bad_codes. But cross-patch errors (e.g. "undefined: isDNSLabel") only
-                # surface here during compilation — Cycle 2 MUST see this as the error_log
-                # so every patch's heal prompt knows what the full failure was.
+                # Surface go vet/test output as the error_log for Cycle 2
+                # (cross-patch compile errors only appear here, not in per-patch gofmt)
                 first_failure_msg = matrix_res.get("diagnostics", "")
-
-            matrix_res["branch"]     = branch_name
-            matrix_res["hypothesis"] = hypothesis
-            matrix_res["bad_codes"]  = bad_codes
-            # Ensure the error_log stored in the result is the real compilation error,
-            # not an empty string. Cycle 2 reads result["diagnostics"] as its error_log.
-            if not matrix_res["passed"] and first_failure_msg:
                 matrix_res["diagnostics"] = first_failure_msg
+
+            matrix_res["branch"]    = branch_name
+            matrix_res["hypothesis"] = hypothesis
+            matrix_res["bad_codes"] = bad_codes
             return matrix_res
 
         except Exception as e:
             return {
-                "track_id":   track_id,
-                "passed":     False,
+                "track_id":    track_id,
+                "passed":      False,
                 "diagnostics": "Track Runtime Exception: " + str(e),
-                "bad_codes":  {},
-                "branch":     branch_name,
-                "hypothesis": hypothesis,
+                "bad_codes":   {},
+                "branch":      branch_name,
+                "hypothesis":  hypothesis,
             }
         finally:
             if wt_workspace and wt_manager:
@@ -580,15 +669,12 @@ class SentinelPipeline:
         # Phase 2: AST Symbol Index
         self.indexer.index_repository(self.repo_path, self.repo_name)
 
-        search_terms = set()
-        search_terms.add(self.repo_name)
-        search_terms.add(analysis.get("target_package", ""))
+        search_terms = {self.repo_name, analysis.get("target_package", "")}
         for f in analysis.get("potential_files", []):
             base = os.path.splitext(os.path.basename(f))[0]
             if base:
                 search_terms.add(base)
-        symptom_words = re.findall(r"[A-Za-z]{4,}", analysis.get("symptom", ""))
-        search_terms.update(symptom_words[:3])
+        search_terms.update(re.findall(r"[A-Za-z]{4,}", analysis.get("symptom", ""))[:3])
 
         all_symbols, seen_names = [], set()
         for term in search_terms:
@@ -606,29 +692,28 @@ class SentinelPipeline:
         # Phase 3: Strategy Planning
         print("🤖 Generating multi-track fix blueprints with Gemini 2.5 Pro...")
         planner_prompt = (
-            "You are a Principal Go Software Engineer designing bug fix strategies.\n\n"
+            "You are a Principal Go Software Engineer designing fix strategies.\n\n"
             "ISSUE SYMPTOM: " + str(analysis.get("symptom")) + "\n"
             "REPRODUCTION NOTES: " + str(analysis.get("reproduction_steps")) + "\n\n"
             "INDEXED SYMBOLS (file_path, symbol_name, start_line, end_line):\n"
             + symbol_ctx + "\n\n"
             "REAL FILES IN REPO (use ONLY these in target_file — never invent paths):\n"
             + file_inventory + "\n\n"
-            "SCHEMA: Each hypothesis has a 'patches' list — one FilePatch per file that needs "
-            "changing. A single hypothesis CAN and SHOULD include patches for multiple files "
-            "when the fix requires it (e.g. both a function definition file AND a registration "
-            "map file). There is no limit on the number of patches per hypothesis.\n\n"
+            "SCHEMA: Each hypothesis has a 'patches' list — one FilePatch per file "
+            "that needs changing. Include ALL files required.\n\n"
             "CRITICAL RULES:\n"
-            "1. target_file must be a path from the REAL FILES list. Never invent paths.\n"
-            "2. start_line and end_line must be real line numbers from the symbol vectors.\n"
-            "3. patch_mode rules:\n"
-            "   'replace' — modifying EXISTING logic (bug fixes, changing existing code)\n"
-            "   'insert_after' — adding NEW code that doesn't exist yet "
-            "(new functions, new map entries, new validator registrations, new imports)\n"
-            "4. When adding a new validator: you MUST include at least two patches:\n"
-            "   a) One patch that adds the validator FUNCTION (insert_after, in baked_in.go or similar)\n"
-            "   b) One patch that registers it in the validator MAP (insert_after, inside bakedInValidators)\n"
-            "5. description must clearly state what this individual file change does.\n"
-            "Output valid JSON matching the StrategyBlueprint schema with exactly 2 hypotheses."
+            "1. target_file must be from REAL FILES list. Never invent paths.\n"
+            "2. start_line and end_line must be real line numbers from symbol vectors.\n"
+            "3. patch_mode:\n"
+            "   'replace' — modifying EXISTING logic\n"
+            "   'insert_after' — adding NEW code that doesn't exist yet\n"
+            "4. When adding a new validator, include at minimum:\n"
+            "   a) A patch that adds the validator FUNCTION\n"
+            "   b) A patch that adds the registration entry in the validator MAP\n"
+            "   Do NOT include patches for translation/documentation files — "
+            "those are optional and frequently cause syntax errors in CI.\n"
+            "5. description must clearly state what this individual change does.\n"
+            "Output valid JSON with exactly 2 hypotheses."
         )
 
         response = self.client.models.generate_content(
@@ -660,17 +745,13 @@ class SentinelPipeline:
             print("❌ Planning Error: fewer than 2 hypotheses returned.")
             return False
 
-        # Validate + correct file paths in every patch across all hypotheses
         for h in hypotheses_raw:
             h["patches"] = _validate_and_correct_patches(h.get("patches", []), self.repo_path)
-            if not h["patches"]:
-                print("⚠️  Hypothesis '" + h.get("title", "?") + "' has no valid patches — dropping.")
 
         hypotheses_raw = [h for h in hypotheses_raw if h.get("patches")]
         if len(hypotheses_raw) < 2:
             print("❌ Planning Error: fewer than 2 valid hypotheses after path validation.")
             return False
-
         hypotheses_raw = hypotheses_raw[:2]
 
         print(
@@ -692,12 +773,11 @@ class SentinelPipeline:
         )
         winning_track = next((r for r in c1_results if r["passed"]), None)
 
-        # Phase 5: Cycle 2 — Self-Healing (if both Cycle 1 tracks fail)
+        # Phase 5: Cycle 2 — Structured Self-Healing
         results = c1_results
         if not winning_track:
             print("\n🚨 Cycle 1 Failed. Launching Self-Healing Cycle 2...")
             print("🏎️  Deploying Cycle 2 concurrently...")
-
             c2_results = await asyncio.gather(
                 self.execute_hypothesis_track(
                     "TRACK_ALPHA",
@@ -736,10 +816,10 @@ class SentinelPipeline:
         print("\n🏆 Winning Branch Verified: " + winning_track["branch"])
         print("📝 Generating pull request title and body with Gemini 2.5 Pro...\n")
 
-        issue_meta   = triage_data.get("meta", {})
-        issue_number = issue_meta.get("issue_number", "?")
-        branch       = winning_track["branch"]
-        hypothesis   = winning_track["hypothesis"]
+        issue_meta    = triage_data.get("meta", {})
+        issue_number  = issue_meta.get("issue_number", "?")
+        branch        = winning_track["branch"]
+        hypothesis    = winning_track["hypothesis"]
         changed_files = ", ".join(p.target_file for p in hypothesis.patches)
 
         pr_result = self.pr_generator.generate(
@@ -780,7 +860,6 @@ class SentinelPipeline:
                 if pr_data:
                     pr_url = pr_data.get("html_url", "")
 
-        # Final summary
         print("=" * W)
         print("🏁  SENTINEL ENGINE — RUN COMPLETE")
         print("=" * W)
@@ -812,5 +891,4 @@ class SentinelPipeline:
         print("  $ git diff HEAD~1 HEAD")
         print("")
         print("=" * W)
-
         return pr_result
