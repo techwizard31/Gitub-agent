@@ -501,10 +501,14 @@ class SentinelPipeline:
         Generates and applies one FilePatch.
         Returns (success, result_message, code_written).
         """
+        # Wide context window: 15 lines before and after the target range.
+        # This gives the LLM enough surrounding code to understand where it is
+        # in the file, which prevents it from generating package/import headers
+        # to orient itself.
         current_code = aci.view_file_range(
             patch.target_file,
-            max(1, patch.start_line - 5),
-            patch.end_line + 5,
+            max(1, patch.start_line - 15),
+            patch.end_line + 15,
         )
 
         if not retry_error_log:
@@ -598,7 +602,13 @@ class SentinelPipeline:
                 # Every patch gets the full error log in Cycle 2 —
                 # cross-patch errors (undefined: X) require all patches to see the same diagnostic
                 retry_bad = (retry_context or {}).get("bad_codes", {}).get(idx, "")
-                retry_err = (retry_context or {}).get("error_log", "")
+                # Use per-patch error if available — more precise than the global error_log
+                per_patch_errors = (retry_context or {}).get("patch_errors", {})
+                retry_err = (
+                    per_patch_errors.get(idx)
+                    or (retry_context or {}).get("error_log", "")
+                    or ""
+                )
 
                 ok, msg, code = await self._apply_single_patch(
                     patch, aci, track_id,
@@ -613,6 +623,11 @@ class SentinelPipeline:
                     if all_patch_success:
                         first_failure_msg = msg
                     all_patch_success = False
+                    # Store per-patch error so Cycle 2 gets the exact right error
+                    # for each patch, not a single global error applied to all
+                    if "patch_errors" not in dir():
+                        patch_errors: dict[int, str] = {}
+                    patch_errors[idx] = msg
                     # Do NOT break — keep applying remaining patches so all bad_codes
                     # are collected, enabling full Cycle 2 self-healing context
 
@@ -622,6 +637,7 @@ class SentinelPipeline:
                     "passed":      False,
                     "diagnostics": first_failure_msg,
                     "bad_codes":   bad_codes,
+                    "patch_errors": locals().get("patch_errors", {}),
                     "branch":      branch_name,
                     "hypothesis":  hypothesis,
                 }
@@ -643,12 +659,13 @@ class SentinelPipeline:
             return matrix_res
 
         except Exception as e:
+            import traceback
             return {
                 "track_id":    track_id,
                 "passed":      False,
-                "diagnostics": "Track Runtime Exception: " + str(e),
-                "bad_codes":   {},
-                "branch":      branch_name,
+                "diagnostics": "Track Runtime Exception: " + str(e) + "\n" + traceback.format_exc(),
+                "bad_codes":   bad_codes if "bad_codes" in dir() else {},
+                "branch":      branch_name if "branch_name" in dir() else "unknown",
                 "hypothesis":  hypothesis,
             }
         finally:
@@ -783,16 +800,18 @@ class SentinelPipeline:
                     "TRACK_ALPHA",
                     FixHypothesis(**hypotheses_raw[0]),
                     retry_context={
-                        "error_log": c1_results[0]["diagnostics"],
-                        "bad_codes": c1_results[0].get("bad_codes", {}),
+                        "error_log":    c1_results[0]["diagnostics"],
+                        "bad_codes":    c1_results[0].get("bad_codes", {}),
+                        "patch_errors": c1_results[0].get("patch_errors", {}),
                     },
                 ),
                 self.execute_hypothesis_track(
                     "TRACK_BETA",
                     FixHypothesis(**hypotheses_raw[1]),
                     retry_context={
-                        "error_log": c1_results[1]["diagnostics"],
-                        "bad_codes": c1_results[1].get("bad_codes", {}),
+                        "error_log":    c1_results[1]["diagnostics"],
+                        "bad_codes":    c1_results[1].get("bad_codes", {}),
+                        "patch_errors": c1_results[1].get("patch_errors", {}),
                     },
                 ),
             )

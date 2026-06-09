@@ -47,8 +47,11 @@ class AgentComputerInterface:
         self, file_path: str, start_line: int, end_line: int, new_content: str
     ) -> str:
         """
-        REPLACE mode: overwrites lines start_line..end_line with new_content.
-        Use for bug fixes that modify existing logic.
+        REPLACE mode: atomically overwrites lines start_line..end_line with new_content.
+
+        ATOMIC: if gofmt fails after writing, the file is immediately restored to its
+        original state. This prevents cascading failures where a corrupt file causes
+        every subsequent patch to land on the wrong lines.
         """
         try:
             safe_path = self._resolve_safe_path(file_path)
@@ -56,9 +59,9 @@ class AgentComputerInterface:
                 return f"Error: Target file '{file_path}' not found."
 
             with open(safe_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
+                original_lines = f.readlines()
 
-            total_lines = len(lines)
+            total_lines = len(original_lines)
             start = max(1, start_line)
             end = min(total_lines, end_line)
 
@@ -66,13 +69,17 @@ class AgentComputerInterface:
             if new_lines and not new_lines[-1].endswith("\n"):
                 new_lines[-1] += "\n"
 
-            updated_lines = lines[: start - 1] + new_lines + lines[end:]
+            updated_lines = original_lines[: start - 1] + new_lines + original_lines[end:]
 
             with open(safe_path, "w", encoding="utf-8") as f:
                 f.writelines(updated_lines)
 
             syntax_status = self.run_local_syntax_check(file_path)
             if "FAIL" in syntax_status:
+                # REVERT — restore original content so the file stays valid
+                # for any subsequent patches in the same hypothesis
+                with open(safe_path, "w", encoding="utf-8") as f:
+                    f.writelines(original_lines)
                 return f"⚠️ Patch written, but local syntax verification intercepted errors:\n{syntax_status}"
 
             return f"✅ Patch applied across lines {start} to {end}."
@@ -83,11 +90,10 @@ class AgentComputerInterface:
         self, file_path: str, after_line: int, new_content: str
     ) -> str:
         """
-        INSERT mode: inserts new_content AFTER after_line without removing anything.
-        Use for enhancements that add new functions, map entries, or validators.
+        INSERT mode: atomically inserts new_content AFTER after_line.
 
-        This is the correct operation for adding new code that doesn't exist yet.
-        'apply_code_patch' (replace) would overwrite existing lines, destroying them.
+        ATOMIC: if gofmt fails after writing, the file is immediately restored to its
+        original state.
         """
         try:
             safe_path = self._resolve_safe_path(file_path)
@@ -95,26 +101,27 @@ class AgentComputerInterface:
                 return f"Error: Target file '{file_path}' not found."
 
             with open(safe_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
+                original_lines = f.readlines()
 
-            total_lines = len(lines)
-            insert_at = min(after_line, total_lines)  # clamp to file length
+            total_lines = len(original_lines)
+            insert_at = min(after_line, total_lines)
 
-            # Ensure new content ends with a newline
             new_lines = new_content.splitlines(keepends=True)
             if new_lines and not new_lines[-1].endswith("\n"):
                 new_lines[-1] += "\n"
-            # Add a blank separator line before inserted block if previous line isn't blank
-            if insert_at > 0 and lines[insert_at - 1].strip():
+            if insert_at > 0 and original_lines[insert_at - 1].strip():
                 new_lines = ["\n"] + new_lines
 
-            updated_lines = lines[:insert_at] + new_lines + lines[insert_at:]
+            updated_lines = original_lines[:insert_at] + new_lines + original_lines[insert_at:]
 
             with open(safe_path, "w", encoding="utf-8") as f:
                 f.writelines(updated_lines)
 
             syntax_status = self.run_local_syntax_check(file_path)
             if "FAIL" in syntax_status:
+                # REVERT — restore original content
+                with open(safe_path, "w", encoding="utf-8") as f:
+                    f.writelines(original_lines)
                 return f"⚠️ Insert written, but local syntax verification intercepted errors:\n{syntax_status}"
 
             return (
@@ -125,9 +132,7 @@ class AgentComputerInterface:
             return f"Error inserting code: {e}"
 
     def run_local_syntax_check(self, file_path: str) -> str:
-        """
-        Uses native 'gofmt' for a fast pre-compilation syntax check.
-        """
+        """Uses gofmt -e for a fast pre-compilation syntax check."""
         try:
             safe_path = self._resolve_safe_path(file_path)
             result = subprocess.run(
