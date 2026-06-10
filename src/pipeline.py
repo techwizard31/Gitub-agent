@@ -68,6 +68,8 @@ class StrategyBlueprint(BaseModel):
 
 def clean_llm_code_output(raw_text: str) -> str:
     """Strips markdown fences, conflict markers, and diff markers from LLM output."""
+    if not raw_text:
+        return ""
     text = raw_text.strip()
     m = re.search(r"```(?:go)?\s*\n(.*?)```", text, re.DOTALL)
     if m:
@@ -229,7 +231,17 @@ def _analyze_error(error_log: str, patch: "FilePatch", aci: "AgentComputerInterf
 
     # ── Classify ────────────────────────────────────────────────────────────
     undef_name = ""
-    if "missing import" in error_log or "missing ',' in argument" in error_log:
+    # Detect LLM outputting top-level declarations (type/func/var) inside function bodies.
+    # Symptoms: "expected '}'" before a type/func keyword, or "found 'type'"/"found 'func'"
+    # at a position that should be inside an existing block.
+    _toplevel_signals = (
+        ("found 'type'" in error_log or "found 'func'" in error_log or
+         "found 'var'" in error_log or "found 'const'" in error_log)
+        and ("expected" in error_log or "found" in error_log)
+    )
+    if _toplevel_signals:
+        error_type = "toplevel"
+    elif "missing import" in error_log or "missing ',' in argument" in error_log:
         error_type = "import"
     elif "SYNTAX FAIL" in error_log or "expected" in error_log or "illegal" in error_log:
         error_type = "syntax"
@@ -276,7 +288,15 @@ def _analyze_error(error_log: str, patch: "FilePatch", aci: "AgentComputerInterf
         pattern = ""
 
     # ── Build surgical instruction ───────────────────────────────────────────
-    if error_type == "import":
+    if error_type == "toplevel":
+        instruction = (
+            "You output a top-level Go declaration (type/func/var/const) inside "
+            "a location that is already inside a struct, interface, or function body. "
+            "Output ONLY the inner body lines — method implementations, field entries, "
+            "or statement lines — NOT a new type or func declaration. "
+            "Study the PATTERN below to see what lines belong at this location."
+        )
+    elif error_type == "import":
         instruction = (
             "Your output included a package declaration or import block. "
             "Output ONLY the function/method body lines for the target range. "
@@ -319,6 +339,60 @@ def _analyze_error(error_log: str, patch: "FilePatch", aci: "AgentComputerInterf
         "pattern":     pattern,
         "instruction": instruction,
     }
+
+
+def _expand_to_symbol_boundary(
+    patch: dict,
+    repo_path: str,
+    indexer,
+    repo_name: str,
+) -> tuple[int, int] | None:
+    """
+    When the planner targets a suspiciously narrow line range (< 3 lines),
+    this finds the nearest enclosing function/method in the SQLite symbol index
+    and returns its (start_line, end_line) instead.
+
+    This prevents the LLM from being asked to replace a blank line or a
+    function signature without its body, which causes gofmt failures.
+    """
+    target_line = patch.get("start_line", 0)
+    target_file = patch.get("target_file", "")
+    if not target_file or not target_line:
+        return None
+
+    try:
+        # Walk the repo to find all symbols in the target file
+        import sqlite3
+        db_path = os.path.join(repo_path, "..", ".cache", "state_cache.db")
+        db_path = os.path.normpath(db_path)
+        if not os.path.exists(db_path):
+            return None
+
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT start_line, end_line FROM repo_symbols
+                WHERE repo_name = ? AND file_path = ?
+                AND symbol_type IN ('function', 'method')
+                ORDER BY start_line
+            """, (repo_name, target_file))
+            symbols = [(row["start_line"], row["end_line"]) for row in cursor.fetchall()]
+
+        if not symbols:
+            return None
+
+        # Find the symbol whose range contains target_line
+        for start, end in symbols:
+            if start <= target_line <= end:
+                return (start, end)
+
+        # No exact match — find the nearest symbol by proximity
+        nearest = min(symbols, key=lambda s: abs(s[0] - target_line))
+        return nearest
+
+    except Exception:
+        return None
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -547,7 +621,10 @@ class SentinelPipeline:
         gen_res = self.client.models.generate_content(
             model="gemini-2.5-flash", contents=prompt
         )
-        code_written = clean_llm_code_output(gen_res.text)
+        raw_text = gen_res.text if gen_res and gen_res.text else ""
+        code_written = clean_llm_code_output(raw_text)
+        if not code_written:
+            return False, "LLM returned empty response — cannot apply patch.", ""
 
         if patch.patch_mode == "insert_after":
             result = aci.insert_after_line(patch.target_file, patch.end_line, code_written)
@@ -591,6 +668,7 @@ class SentinelPipeline:
             all_patch_success = True
             first_failure_msg = ""
             bad_codes: dict[int, str] = {}
+            patch_errors: dict[int, str] = {}
 
             for idx, patch in enumerate(hypothesis.patches):
                 label = (
@@ -625,8 +703,6 @@ class SentinelPipeline:
                     all_patch_success = False
                     # Store per-patch error so Cycle 2 gets the exact right error
                     # for each patch, not a single global error applied to all
-                    if "patch_errors" not in dir():
-                        patch_errors: dict[int, str] = {}
                     patch_errors[idx] = msg
                     # Do NOT break — keep applying remaining patches so all bad_codes
                     # are collected, enabling full Cycle 2 self-healing context
@@ -637,7 +713,7 @@ class SentinelPipeline:
                     "passed":      False,
                     "diagnostics": first_failure_msg,
                     "bad_codes":   bad_codes,
-                    "patch_errors": locals().get("patch_errors", {}),
+                    "patch_errors": patch_errors,
                     "branch":      branch_name,
                     "hypothesis":  hypothesis,
                 }
@@ -708,6 +784,26 @@ class SentinelPipeline:
 
         # Phase 3: Strategy Planning
         print("🤖 Generating multi-track fix blueprints with Gemini 2.5 Pro...")
+        # Build file snippets for the files most likely to need patching
+        # This shows the LLM actual code content so it can pick correct line ranges
+        file_snippets = ""
+        snippet_files = list({
+            f for f in analysis.get("potential_files", [])
+            if f and os.path.exists(os.path.join(self.repo_path, f))
+        })[:3]
+        for sf in snippet_files:
+            try:
+                full = os.path.join(self.repo_path, sf)
+                with open(full, encoding="utf-8", errors="ignore") as fh:
+                    lines = fh.readlines()
+                numbered = "".join(
+                    str(i + 1).rjust(4) + " | " + l
+                    for i, l in enumerate(lines[:200])  # first 200 lines max
+                )
+                file_snippets += "\n--- " + sf + " (first 200 lines) ---\n" + numbered
+            except Exception:
+                pass
+
         planner_prompt = (
             "You are a Principal Go Software Engineer designing fix strategies.\n\n"
             "ISSUE SYMPTOM: " + str(analysis.get("symptom")) + "\n"
@@ -716,13 +812,17 @@ class SentinelPipeline:
             + symbol_ctx + "\n\n"
             "REAL FILES IN REPO (use ONLY these in target_file — never invent paths):\n"
             + file_inventory + "\n\n"
-            "SCHEMA: Each hypothesis has a 'patches' list — one FilePatch per file "
+            + ("ACTUAL FILE CONTENT (use these line numbers for start_line/end_line):\n"
+               + file_snippets + "\n\n" if file_snippets else "")
+            + "SCHEMA: Each hypothesis has a 'patches' list — one FilePatch per file "
             "that needs changing. Include ALL files required.\n\n"
             "CRITICAL RULES:\n"
             "1. target_file must be from REAL FILES list. Never invent paths.\n"
-            "2. start_line and end_line must be real line numbers from symbol vectors.\n"
+            "2. start_line and end_line MUST span the COMPLETE function or block to change.\n"
+            "   Never target a blank line or a single line — always cover the entire\n"
+            "   function signature through its closing brace.\n"
             "3. patch_mode:\n"
-            "   'replace' — modifying EXISTING logic\n"
+            "   'replace' — modifying EXISTING logic (must cover full function body)\n"
             "   'insert_after' — adding NEW code that doesn't exist yet\n"
             "4. When adding a new validator, include at minimum:\n"
             "   a) A patch that adds the validator FUNCTION\n"
@@ -764,6 +864,23 @@ class SentinelPipeline:
 
         for h in hypotheses_raw:
             h["patches"] = _validate_and_correct_patches(h.get("patches", []), self.repo_path)
+            # Expand any suspiciously narrow line ranges — a patch covering fewer
+            # than 3 lines almost always means the planner targeted a blank line
+            # or only the function signature instead of the whole function body.
+            for p in h.get("patches", []):
+                if p.get("patch_mode", "replace") == "replace":
+                    span = p.get("end_line", 0) - p.get("start_line", 0)
+                    if span < 3:
+                        # Find the enclosing symbol from the index
+                        expanded = _expand_to_symbol_boundary(
+                            p, self.repo_path, self.indexer, self.repo_name
+                        )
+                        if expanded:
+                            p["start_line"] = expanded[0]
+                            p["end_line"]   = expanded[1]
+                            print("  📐 Expanded narrow patch range → lines "
+                                  + str(expanded[0]) + "-" + str(expanded[1])
+                                  + " in " + p.get("target_file", ""))
 
         hypotheses_raw = [h for h in hypotheses_raw if h.get("patches")]
         if len(hypotheses_raw) < 2:
