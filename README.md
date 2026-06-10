@@ -1,644 +1,549 @@
-# 🛡️ The Sentinel Engine
+# The Sentinel Engine
 
-> An autonomous, parallel AI coding agent that resolves GitHub issues in open-source Go repositories — end to end, from issue URL to merged-ready Pull Request.
+An autonomous Python pipeline that takes a GitHub issue URL and produces a merge-ready Pull Request for open-source Go repositories. You provide credentials and run one command; the engine forks the repo, triages the issue, plans and applies a fix, verifies it with the Go toolchain, and opens a PR on your fork.
 
 ---
 
 ## Table of Contents
 
-1. [What This Is](#what-this-is)
-2. [How It Works — The Full Pipeline](#how-it-works--the-full-pipeline)
-3. [Architecture Deep Dive](#architecture-deep-dive)
-4. [Directory Structure](#directory-structure)
-5. [Prerequisites](#prerequisites)
-6. [Installation & Setup](#installation--setup)
-7. [Configuration](#configuration)
-8. [Running the Engine](#running-the-engine)
-9. [Understanding the Output](#understanding-the-output)
-10. [Cost Per Run](#cost-per-run)
-11. [Design Decisions](#design-decisions)
-12. [Supported Repositories](#supported-repositories)
-13. [Troubleshooting](#troubleshooting)
+1. [What It Does](#what-it-does)
+2. [What It Does Not Do](#what-it-does-not-do)
+3. [Pipeline Overview](#pipeline-overview)
+4. [Issue Admission Gate](#issue-admission-gate)
+5. [Fix Execution (Small vs Medium)](#fix-execution-small-vs-medium)
+6. [Architecture](#architecture)
+7. [Directory Structure](#directory-structure)
+8. [Prerequisites](#prerequisites)
+9. [Installation](#installation)
+10. [Configuration](#configuration)
+11. [Running the Engine](#running-the-engine)
+12. [Understanding the Output](#understanding-the-output)
+13. [Cost Per Run](#cost-per-run)
+14. [Design Decisions](#design-decisions)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
-## What This Is
+## What It Does
 
-The Sentinel Engine is a deterministic, zero-dependency Python state machine that autonomously resolves GitHub issues in open-source Go repositories. Given nothing but a GitHub issue URL and API credentials, it:
+Given a GitHub issue URL, a Gemini API key, and a GitHub Personal Access Token, the engine:
 
-1. Reads and structurally understands the issue using Gemini 2.5 Pro
-2. Forks the target repository into your GitHub account
-3. Indexes the Go codebase locally into a SQLite symbol cache
-4. Generates two distinct fix strategies in parallel, each in an isolated Git Worktree
-5. Applies each patch, runs `go vet` and `go test` to verify correctness
-6. If both fail, feeds the compiler errors back to Gemini for automatic repair (Self-Healing Loop)
-7. Commits the winning patch, pushes it to your fork, and opens a real Pull Request
+1. Forks the target repository into your GitHub account and clones it locally
+2. Fetches the issue and runs structured triage with Gemini 2.5 Pro
+3. **Admits or rejects** the issue based on bug-fix suitability (see [Issue Admission Gate](#issue-admission-gate))
+4. Indexes all Go symbols (functions, methods, structs) into a local SQLite cache keyed by git commit
+5. Plans one or two fix hypotheses (depending on complexity tier) with exact file and symbol targets
+6. Applies patches in isolated Git worktrees with per-patch verification and automatic error recovery
+7. Runs `go build`, `go vet`, and `go test` on the patched code
+8. On failure, replans with a memory of what already failed
+9. Commits the winning patch, pushes to your fork, and opens a cross-repo PR upstream
 
-**The entire process is zero-touch.** You run one command. The PR link is printed at the end.
+The PR URL is printed at the end of a successful run.
+
+**Validated example:** [spf13/cobra #2193](https://github.com/spf13/cobra/issues/2193) — context propagation bug in `ExecuteC` — fixed and PR opened automatically.
 
 ---
 
-## How It Works — The Full Pipeline
+## What It Does Not Do
 
-Here is a step-by-step walkthrough of exactly what happens when you run the engine:
+To set expectations clearly:
+
+- **No feature or enhancement work** — only surgical bug fixes in existing code (`replace` patches; no new APIs or files)
+- **No security/CVE issues** — rejected at admission
+- **No architectural rewrites** — issues requiring 3+ files or large refactors are rejected
+- **No image/screenshot analysis** — issue images are not processed
+- **No cross-run learning** — each `python src/main.py` invocation starts fresh
+- **No Docker** — native Git worktrees and the local Go toolchain only
+- **No vector database** — symbol lookup is exact, via SQLite
+
+---
+
+## Pipeline Overview
 
 ```
 python src/main.py
 ```
 
-### Phase 0 — Environment Check
-The engine verifies that `go` and `git` are installed and accessible in your system PATH. If either is missing, the engine exits with a clear error message before doing anything else.
+| Phase | What happens |
+|-------|----------------|
+| **0 — Env check** | Verifies `go` and `git` are on PATH |
+| **1 — Fork & clone** | Forks upstream into your account, waits until ready, clones your fork locally |
+| **2 — Triage** | Fetches issue title, body, labels; Gemini 2.5 Pro returns structured `TriageAnalysis` JSON |
+| **3 — Index** | Walks `.go` files, extracts symbols + line ranges → `.cache/state_cache.db` |
+| **3b — Admission** | Code-level pre-flight: labels, confidence, symbol resolution, file existence |
+| **4 — Plan** | Gemini 2.5 Pro produces `StrategyBlueprint` (1 or 2 hypotheses with `FilePatch` lists) |
+| **5 — Execute** | Parallel worktree tracks apply patches with micro-heal + verify-after-patch |
+| **6 — Replan** | If all tracks fail tests, replan with `FailureMemory` (1× for small, up to 2× for medium) |
+| **7 — PR** | Gemini 2.5 Pro generates conventional-commit title + Markdown body |
+| **8 — Push & open PR** | Pushes branch to your fork, opens `your-fork:branch → upstream:main` |
 
-### Phase 1 — GitHub Fork Setup
-Using your Personal Access Token, the engine:
-- Calls `GET /user` to resolve your GitHub username from the token
-- Calls `POST /repos/{owner}/{repo}/forks` to fork the target repository into your account
-- Polls `GET /repos/{you}/{repo}` every 3 seconds until GitHub confirms the fork is ready (forks are created asynchronously)
-- Clones **your fork** locally using a token-authenticated HTTPS URL — `git` never prompts for a password
+### Fork model
 
-This is the correct open-source contribution model. You never push directly to the upstream repo. All changes go to your fork, and the PR is opened from `your-fork:branch → upstream:main`.
+The engine never pushes to upstream directly. It forks into your account, patches your fork, and opens a PR from `your-username:branch` to `upstream-owner:main`.
 
-### Phase 2 — Issue Triage (Gemini 2.5 Pro)
-The engine fetches the full issue body from the GitHub REST API and passes it to Gemini 2.5 Pro with a strict Pydantic schema. The model returns a structured JSON object containing:
+---
+
+## Issue Admission Gate
+
+Before any fix planning runs, the engine decides whether the issue is worth attempting. This keeps cost low (~$0.05) on unsuitable issues and focuses effort on fixable bugs.
+
+### Admitted: small and medium bugs
+
+| Tier | Criteria | Execution |
+|------|----------|-----------|
+| **Small** | 1 file, 1 symbol, stack trace or clear repro, confidence ≥ 0.85 | 1 track, max 1 patch, 1 replan |
+| **Medium** | 1–2 files, clear bug (not feature), confidence ≥ 0.70 | 2 tracks (ALPHA + BETA), max 2 patches, up to 2 replans |
+
+### Rejected automatically
+
+| Reason | Signals |
+|--------|---------|
+| Feature / proposal | `feat:` title, labels `type/proposal`, `enhancement`, `proposal` |
+| Security | Label `security`, CVE/auth/crypto content |
+| Architecture | 3+ files, rewrite language, `is_architectural` flag |
+| Unclear direction | Labels `needs-discussion`, `question`, open debate |
+| New code required | New functions, files, or public API as primary deliverable |
+| Symbol not found | Anchor function/method cannot be resolved in the SQLite index |
+| Low confidence | Below tier threshold |
+
+When rejected, the run exits after triage with a message like:
+
+```
+ADMISSION REJECTED: Title indicates feature/proposal: 'feat: add SSE support'
+```
+
+Example: [gin #4661](https://github.com/gin-gonic/gin/issues/4661) (SSE feature proposal) is rejected; [cobra #2193](https://github.com/spf13/cobra/issues/2193) (one-line logic bug) is admitted.
+
+### Triage output schema
 
 ```json
 {
-  "symptom": "Nil pointer panic when command context is nil",
+  "symptom": "Subcommand receives stale context on second ExecuteContext call",
   "target_package": "cobra",
   "potential_files": ["command.go"],
-  "reproduction_steps": "Create a parent command with PersistentPreRun that sets context...",
-  "is_breaking_change_risk": false
+  "reproduction_steps": "Execute subcommand twice with different contexts...",
+  "is_breaking_change_risk": false,
+  "complexity": "small",
+  "confidence": 1.0,
+  "anchor_symbol": "ExecuteC",
+  "target_file": "command.go",
+  "requires_new_code": false,
+  "is_security_related": false,
+  "is_architectural": false,
+  "maintainer_decision_unclear": false,
+  "estimated_files": 1,
+  "has_clear_repro": true,
+  "admitted": true,
+  "reject_reason": ""
 }
 ```
 
-This structured output — not free-form text — is what drives every downstream decision. No hallucinated file paths. No vague descriptions.
+---
 
-### Phase 3 — AST Symbol Indexing (SQLite Cache)
-The engine walks the cloned repository and lexically parses every `.go` file (excluding test files) to extract:
-- Function names and signatures
-- Method names and receivers
-- Struct and interface definitions
-- Exact start and end line numbers for each symbol
+## Fix Execution (Small vs Medium)
 
-All of this is stored in a local SQLite database (`.cache/state_cache.db`). On subsequent runs against the same Git commit, the index is loaded instantly from cache — no re-parsing.
+### Patch model
 
-This eliminates the need for a vector database. The agent knows *exactly* which file and which lines to look at, rather than doing fuzzy semantic search.
-
-### Phase 4 — Strategy Planning (Gemini 2.5 Pro)
-Using the structured triage result and the top symbol matches from the SQLite cache, the engine asks Gemini 2.5 Pro to design exactly **two distinct fix strategies**. The output is again a strict Pydantic schema:
+Each fix hypothesis contains an ordered list of `FilePatch` entries:
 
 ```json
 {
-  "hypotheses": [
+  "title": "Propagate context to subcommand in ExecuteC",
+  "patches": [
     {
-      "title": "Inherit Context Recursively from Parent Command",
       "target_file": "command.go",
-      "start_line": 232,
-      "end_line": 237,
-      "proposed_code": "..."
-    },
-    {
-      "title": "Propagate Context via Target Command in Execution Loop",
-      "target_file": "command.go",
-      "start_line": 951,
-      "end_line": 958,
-      "proposed_code": "..."
+      "start_line": 1084,
+      "end_line": 1170,
+      "anchor_symbol": "ExecuteC",
+      "patch_mode": "replace",
+      "description": "Always assign cmd.ctx = c.ctx before execute",
+      "new_code": "..."
     }
   ]
 }
 ```
 
-Having two distinct hypotheses means the engine hedges its bets — two different interpretations of the fix run simultaneously.
+Rules enforced in code:
 
-### Phase 5 — Parallel Execution (Git Worktrees + asyncio)
-For each hypothesis, the engine:
+- **`replace` only** — modifies existing logic; `insert_after` patches are dropped
+- **Max 1 replace per file** per hypothesis — prevents stale line-number drift from duplicate patches on the same file
+- **Symbol re-anchoring** — before each patch, `anchor_symbol` is resolved fresh from SQLite so line numbers stay current after prior edits
+- **Stop on failure** — if a patch cannot be healed, remaining patches are skipped and touched files are reverted with `git checkout --`
 
-1. Creates an isolated **Git Worktree** — a separate physical directory on disk, each on its own branch (`sentinel/track_alpha`, `sentinel/track_beta`). Worktrees share the same `.git` directory but have completely independent working trees. This means both tracks can modify files and run tests simultaneously without interfering with each other.
+### Per-patch verification and micro-heal
 
-2. Reads the current source code at the target line range using the Agent-Computer Interface (ACI), giving the LLM precise context — not the entire file.
+After each patch is applied:
 
-3. Calls **Gemini 2.5 Flash** to generate the actual replacement Go code for those lines.
+1. `gofmt -e` (inside ACI; reverts file on syntax failure)
+2. `go build` on the changed package
 
-4. Applies the patch via the ACI's range-bound injector, which splices the new code into the exact line range and runs `gofmt -e` immediately to catch syntax errors before tests even run.
+If verification fails, a micro-heal loop runs before giving up:
 
-5. Runs `go vet ./...` and `go test -short ./...` **concurrently** using Python's `asyncio.gather()`.
+| Tier | Flash heal attempts | Pro escalation |
+|------|---------------------|----------------|
+| Small | Up to 3 | 1 final attempt with Gemini 2.5 Pro |
+| Medium | Up to 2 | 1 final attempt with Gemini 2.5 Pro |
 
-Both tracks run simultaneously. Neither blocks the other.
+Heal prompts use structured error classification (syntax, undefined, type) and read ±5 lines around the compiler error line for precision.
 
-### Phase 6 — Self-Healing Loop (Gemini 2.5 Flash)
-If both tracks fail verification, the engine does not give up. It:
+### Full test suite
 
-1. Captures the exact compiler/linter error from each failed track
-2. Feeds it back to Gemini 2.5 Flash along with the previous failed code attempt
-3. Asks for a targeted correction with the error as context
-4. Deploys a second parallel cycle (Cycle 2) with the healed code
+After all patches pass per-patch verification:
 
-This means the engine can recover from LLM output that compiles but has a logic error, or that has a simple syntax mistake — automatically, without human intervention.
+- `go build ./...`
+- `go vet ./...`
+- `go test -short` on changed packages (with baseline diffing — pre-existing failures in the upstream repo are ignored)
 
-### Phase 7 — PR Generation (Gemini 2.5 Pro)
-Once a winning track is identified (one that passes all tests), the engine generates a full Pull Request using Gemini 2.5 Pro with another Pydantic schema. The output includes:
-- A conventional-commit-style PR title (e.g., `fix(cobra): propagate parent context to child commands`)
-- A structured Markdown body with: Summary, Problem, Solution, Changes table, Testing section, Checklist
+### Replanning (not same-blueprint retry)
 
-### Phase 8 — Push & Open PR
-The engine:
-1. Commits the patch to the winning branch in the worktree
-2. Fetches that branch back into the main local repo
-3. Pushes the branch to **your fork** on GitHub
-4. Opens a cross-repo PR via `POST /repos/{upstream}/{repo}/pulls` with `head: "you:branch"` and `base: "main"`
-5. Prints the live PR URL
+If tracks fail the full test suite, the engine does **not** retry the identical blueprint. It calls Gemini 2.5 Pro again with a `FailureMemory` list:
+
+```json
+{
+  "track": "TRACK_ALPHA",
+  "file": "command.go",
+  "symbol": "ExecuteC",
+  "error": "BUILD FAIL: ...",
+  "code_attempted": "...",
+  "cycle": 1
+}
+```
+
+The replanner must produce a **different** approach than all recorded failures.
+
+### LLM call budget
+
+Hard caps prevent runaway cost:
+
+| Tier | Max LLM calls |
+|------|---------------|
+| Small | 10 |
+| Medium | 14 |
+
+### Branch naming
+
+Branches are unique per run:
+
+```
+sentinel/issue-{N}/{track}-c{cycle}-{unix_timestamp}
+```
+
+Example: `sentinel/issue-2193/track-alpha-c1-1781081207`
 
 ---
 
-## Architecture Deep Dive
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        main.py                                  │
-│  ┌──────────────┐   ┌──────────────────────────────────────┐   │
-│  │ Env Check    │   │        GitHubClient                  │   │
-│  │ go, git      │   │  fork → wait → clone fork            │   │
-│  └──────────────┘   └──────────────────────────────────────┘   │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                    SentinelPipeline.run_pipeline()
-                              │
-          ┌───────────────────┼────────────────────┐
-          │                   │                    │
-   ┌──────▼──────┐   ┌────────▼────────┐  ┌───────▼────────┐
-   │   Triage    │   │  AST Indexer    │  │  PR Generator  │
-   │  (Gemini    │   │  (SQLite cache  │  │  (Gemini 2.5   │
-   │   2.5 Pro)  │   │   go file walk) │  │   Pro → MD)    │
-   └─────────────┘   └─────────────────┘  └────────────────┘
-          │
-   ┌──────▼──────────────────────────────────┐
-   │         Strategy Planning               │
-   │         (Gemini 2.5 Pro → JSON)         │
-   └──────┬──────────────────────┬───────────┘
-          │                      │
-   ┌──────▼──────┐        ┌──────▼──────┐
-   │ TRACK_ALPHA │        │  TRACK_BETA │   ← asyncio.gather()
-   │ Worktree A  │        │  Worktree B │   ← fully isolated
-   │             │        │             │
-   │ Gemini 2.5  │        │ Gemini 2.5  │
-   │ Flash →     │        │ Flash →     │
-   │ ACI patch → │        │ ACI patch → │
-   │ go vet/test │        │ go vet/test │
-   └──────┬──────┘        └──────┬──────┘
-          │    (if both fail)    │
-          └──────────┬───────────┘
-                     │
-          ┌──────────▼───────────┐
-          │   Self-Healing Loop  │
-          │ (Gemini 2.5 Flash +  │
-          │  compiler error log) │
-          └──────────┬───────────┘
-                     │ winning track
-          ┌──────────▼───────────┐
-          │   git commit →       │
-          │   git push fork →    │
-          │   GitHub PR API      │
-          └──────────────────────┘
+│  main.py                                                        │
+│    env check → GitHubClient (fork, clone) → SentinelPipeline    │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+              SentinelPipeline.run_pipeline()
+                             │
+     ┌───────────────────────┼────────────────────────┐
+     │                       │                        │
+┌────▼─────┐          ┌──────▼──────┐          ┌──────▼──────┐
+│  Triage  │          │   Indexer   │          │ PR Generator│
+│ Pro JSON │          │ SQLite AST  │          │  Pro → MD   │
+│ + gate   │          │   symbols   │          └─────────────┘
+└────┬─────┘          └──────┬──────┘
+     │                       │
+     └───────────┬───────────┘
+                 │
+        ┌────────▼────────┐
+        │ Strategy Plan   │  Gemini 2.5 Pro → StrategyBlueprint
+        └────────┬────────┘
+                 │
+    ┌────────────┴────────────┐
+    │ small: 1 track          │
+    │ medium: ALPHA + BETA    │  asyncio.gather (medium only)
+    └────────────┬────────────┘
+                 │
+        ┌────────▼────────────────────────┐
+        │  Worktree + ACI per track       │
+        │  re-anchor → patch → micro-heal │
+        │  → go build → (next patch)      │
+        │  → go vet + go test             │
+        └────────┬────────────────────────┘
+                 │ on failure
+        ┌────────▼────────┐
+        │ Replan + retry  │  FailureMemory → Pro
+        └────────┬────────┘
+                 │ winner
+        ┌────────▼────────┐
+        │ commit → push   │
+        │ → open PR       │
+        └─────────────────┘
 ```
 
-### Module Reference
+### Module reference
 
 | File | Responsibility |
 |------|----------------|
-| `src/main.py` | Entry point. Env check, fork setup, pipeline boot |
-| `src/pipeline.py` | Orchestrator. Runs all phases, manages parallel tracks |
+| `src/main.py` | Entry point: env check, fork setup, boots pipeline |
+| `src/pipeline.py` | Orchestrator: admission, planning, tracks, micro-heal, replan |
 | `src/github_client.py` | GitHub REST API: fork, clone, push, open PR |
-| `src/ingestion/triage.py` | GitHub issue fetch + Gemini structured triage |
-| `src/ingestion/vision.py` | Extracts and analyzes image attachments in issues |
-| `src/ingestion/pr_generator.py` | Generates PR title + Markdown body via Gemini |
-| `src/indexing/indexer.py` | Go AST symbol parser + SQLite cache |
-| `src/aci/tools.py` | Safe file reader + range-bound patch applicator + gofmt check |
-| `src/verification/worktree.py` | Git Worktree lifecycle (create, cleanup) |
-| `src/verification/tester.py` | Async `go vet` + `go test` runner |
+| `src/ingestion/triage.py` | Issue fetch, structured triage, `run_admission_checks()` |
+| `src/ingestion/pr_generator.py` | PR title + multi-patch Markdown body |
+| `src/indexing/indexer.py` | Go symbol parser, SQLite cache, `resolve_symbol()` |
+| `src/aci/tools.py` | Safe file read, range-bound patch, `gofmt` + `go build` verify |
+| `src/verification/worktree.py` | Git worktree create/cleanup |
+| `src/verification/tester.py` | Async `go build` + `go vet` + `go test` with baseline diffing |
 
-### LLM Model Strategy
+### LLM model usage
 
-The engine uses a deliberate two-tier model approach:
-
-| Task | Model | Reason |
-|------|-------|--------|
-| Issue triage (structured JSON) | `gemini-2.5-pro` | Requires deep reasoning to extract structured constraints from free-form bug reports |
-| Fix planning (two hypotheses) | `gemini-2.5-pro` | Complex multi-step analysis of AST symbols + bug context to produce precise line targets |
-| Code generation (patch writing) | `gemini-2.5-flash` | High-velocity, runs twice in parallel — Flash is fast and cost-efficient for targeted code rewrites |
-| Self-healing (error correction) | `gemini-2.5-flash` | Runs in a tight loop with compiler feedback — speed matters here |
-| PR generation (Markdown body) | `gemini-2.5-pro` | Needs to produce coherent, professional prose that accurately references code changes |
+| Task | Model |
+|------|-------|
+| Issue triage + admission fields | `gemini-2.5-pro` |
+| Fix planning + replanning | `gemini-2.5-pro` |
+| Code generation + micro-heal (Flash attempts) | `gemini-2.5-flash` |
+| Micro-heal Pro escalation | `gemini-2.5-pro` |
+| PR title and body | `gemini-2.5-pro` |
 
 ---
 
 ## Directory Structure
 
 ```
-sentinel-agent/
-│
+Gitub-agent/
 ├── src/
-│   ├── main.py                  # Entry point
-│   ├── pipeline.py              # Core orchestration state machine
-│   ├── github_client.py         # GitHub API: fork, clone, push, open PR
-│   │
+│   ├── main.py
+│   ├── pipeline.py
+│   ├── github_client.py
 │   ├── ingestion/
-│   │   ├── triage.py            # Issue parsing + Gemini structured triage
-│   │   ├── vision.py            # Image attachment analysis
-│   │   └── pr_generator.py      # PR title + body generation
-│   │
+│   │   ├── triage.py
+│   │   └── pr_generator.py
 │   ├── indexing/
-│   │   └── indexer.py           # Go AST parser + SQLite symbol cache
-│   │
+│   │   └── indexer.py
 │   ├── aci/
-│   │   └── tools.py             # Agent-Computer Interface (read + patch files)
-│   │
+│   │   └── tools.py
 │   └── verification/
-│       ├── worktree.py          # Git Worktree manager
-│       └── tester.py            # Async go vet + go test runner
-│
-├── .cache/                      # SQLite index (auto-generated, gitignored)
+│       ├── worktree.py
+│       └── tester.py
+├── .cache/                  # SQLite index (auto-created, gitignored)
 │   └── state_cache.db
-│
-├── worktrees/                   # Temporary isolated branches (auto-cleaned)
-│
-├── .env                         # Your credentials (never commit this)
-├── .env.example                 # Template
+├── worktrees/               # Temporary worktrees (auto-cleaned)
+├── .env                     # Credentials (never commit)
+├── .env.example
 ├── requirements.txt
 └── README.md
 ```
+
+After the first real run, a clone of the target repo also appears at `./{repo-name}/` (e.g. `./cobra/`).
 
 ---
 
 ## Prerequisites
 
-Before running the engine, you need the following installed on your machine.
-
-### 1. Python 3.11 or higher
-
-Check your version:
-```bash
-python --version
-```
-
-Install if needed:
-- **Windows**: `winget install --id Python.Python.3.12 -e`
-- **macOS**: `brew install python@3.12`
-- **Linux**: `sudo apt install python3.12`
-
-### 2. Git
-
-Check:
-```bash
-git --version
-```
-
-Install:
-- **Windows**: `winget install --id Git.Git -e`
-- **macOS**: `brew install git`
-- **Linux**: `sudo apt install git`
-
-### 3. Go Compiler (1.20 or higher)
-
-Check:
-```bash
-go version
-```
-
-Install from https://go.dev/dl/ or:
-- **Windows**: `winget install --id GoLang.Go -e`
-- **macOS**: `brew install go`
-- **Linux**: `sudo apt install golang-go`
-
-> ⚠️ After installing Go on Windows, restart your terminal so the PATH updates take effect.
-
-### 4. API Keys (see Configuration section below)
-
-- A **Google Gemini API key** (free tier available at https://aistudio.google.com)
-- A **GitHub Personal Access Token** with `repo` scope
+| Tool | Version | Check |
+|------|---------|-------|
+| Python | 3.11+ | `python --version` |
+| Git | any recent | `git --version` |
+| Go | 1.20+ | `go version` |
+| Gemini API key | — | https://aistudio.google.com |
+| GitHub PAT | `repo` scope | https://github.com/settings/tokens |
 
 ---
 
-## Installation & Setup
-
-### Step 1 — Clone this repository
+## Installation
 
 ```bash
-git clone https://github.com/yourusername/sentinel-agent.git
-cd sentinel-agent
-```
+git clone <this-repo-url>
+cd Gitub-agent
 
-### Step 2 — Create a Python virtual environment
-
-**Windows (PowerShell):**
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-```
-
-**macOS / Linux:**
-```bash
 python3 -m venv venv
-source venv/bin/activate
-```
+source venv/bin/activate        # Windows: venv\Scripts\Activate.ps1
 
-You should see `(venv)` in your terminal prompt after activation.
-
-### Step 3 — Install dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-This installs:
-- `google-genai` — official Google Generative AI SDK
-- `python-dotenv` — loads credentials from `.env` file
-- `pydantic` — structured data validation for LLM outputs
-
-That's it. No Docker, no vector databases, no heavy ML dependencies.
+Dependencies: `google-genai`, `python-dotenv`, `pydantic`.
 
 ---
 
 ## Configuration
 
-### Step 1 — Create your `.env` file
+Copy the example and fill in your values:
 
-Copy the example file:
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and fill in your values:
-
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
 GITHUB_PERSONAL_ACCESS_TOKEN=ghp_your_github_token_here
-GITHUB_ISSUE_URL=https://github.com/spf13/cobra/issues/2194
+GITHUB_ISSUE_URL=https://github.com/spf13/cobra/issues/2193
 
-# Set to "true" to skip GitHub forking and use a local mock repo (offline dev only)
+# Optional: seed a local mock Go repo instead of forking (still needs token + issue URL)
 SENTINEL_USE_MOCK_REPO=false
 ```
 
-### Step 2 — Get a Gemini API Key
+### Choosing a good issue
 
-1. Go to https://aistudio.google.com
-2. Sign in with your Google account
-3. Click **Get API Key** → **Create API Key**
-4. Copy the key into `GEMINI_API_KEY` in your `.env`
+Pick **small or medium bug fixes** in any open-source Go repository:
 
-> The free tier is sufficient for testing. Each full run costs approximately **₹30** (see Cost section).
+- Stack trace or minimal reproduction in the issue body
+- Fix is a guard, condition, or logic correction in existing code
+- Title starts with `BUG:` or `fix:` rather than `feat:`
 
-### Step 3 — Get a GitHub Personal Access Token
+**Good examples:**
 
-1. Go to https://github.com/settings/tokens
-2. Click **Generate new token (classic)**
-3. Give it a name like `sentinel-engine`
-4. Under **Scopes**, check **`repo`** (this covers forking, pushing, and opening PRs)
-5. Click **Generate token**
-6. Copy the token (starts with `ghp_`) into `GITHUB_PERSONAL_ACCESS_TOKEN` in your `.env`
+| Issue | Why |
+|-------|-----|
+| [cobra #2193](https://github.com/spf13/cobra/issues/2193) | Small — one method, one-line logic fix, clear repro |
+| [cobra #2104](https://github.com/spf13/cobra/issues/2104) | Medium — `command.go`, repro gist, no open PR |
 
-> ⚠️ You only see the token once. Copy it immediately before closing the page.
+**Reject examples (engine will exit early):**
 
-### Step 4 — Choose a GitHub Issue
-
-Set `GITHUB_ISSUE_URL` to any issue from the supported repositories (see [Supported Repositories](#supported-repositories)). Example:
-
-```env
-GITHUB_ISSUE_URL=https://github.com/spf13/cobra/issues/2194
-```
-
-**Tips for choosing a good issue:**
-- Pick a small, well-described bug (not a feature request)
-- Issues with stack traces or reproduction steps work best
-- Avoid issues marked `needs-discussion` or `breaking-change`
+| Issue | Why |
+|-------|-----|
+| [gin #4661](https://github.com/gin-gonic/gin/issues/4661) | Feature proposal — new SSE methods |
+| Issues labeled `security`, `type/proposal`, `needs-discussion` | Admission gate |
 
 ---
 
 ## Running the Engine
 
-Make sure your virtual environment is active (`(venv)` in your prompt), then:
-
 ```bash
 python src/main.py
 ```
 
-### What you will see
+### Example successful output (abbreviated)
 
 ```
-======================================================================
-🛡️  THE SENTINEL ENGINE: AUTOMATED AGENTIC PIPELINE PLATFORM
-======================================================================
-👤 Authenticated as: your-github-username
-🍴 Forking spf13/cobra → your-github-username/cobra ...
-✅ Fork created: https://github.com/your-github-username/cobra
-⏳ Waiting for fork to initialise on GitHub...
-✅ Fork is ready.
-📥 Cloning fork: https://github.com/your-github-username/cobra → .../cobra
-✅ Fork cloned successfully.
+Authenticated as: your-username
+Forking spf13/cobra → your-username/cobra ...
+Fork cloned successfully.
 
-====== STARTING SENTINEL ENGINE EXECUTION MATRIX ======
+Analyzing issue with Gemini 2.5 Pro (structured triage + admission)...
+Issue admitted as SMALL bug (confidence: 1.0)
 
-🔎 Parsing target endpoint: https://github.com/spf13/cobra/issues/2194
-🌐 Fetching runtime data from GitHub REST API for Issue #2194...
-🤖 Analyzing issue with Gemini 2.5 Pro (structured triage)...
-🎯 Target Acquired: Closes #2193
+Generating fix blueprint(s) with Gemini 2.5 Pro...
+   Track ALPHA: 'Propagate Context to Subcommand in ExecuteC' (1 patch)
 
-📦 Checking index telemetry for execution context: cobra [ad460ea8]
-🔍 Index Cache Miss. Commencing complete code structural mapping...
-✅ Code structural index sync completed. Registered 312 active code symbols.
+Deploying cycle 1 track(s)...
+[TRACK_ALPHA][patch 1/1] → command.go [ExecuteC] lines 1084-1170
+PASSED ALL VERIFICATIONS
 
-🤖 Generating multi-track fix blueprints with Gemini 2.5 Pro...
-📊 Blueprint locked. Track ALPHA: 'Inherit Context from Parent' | Track BETA: 'Propagate via Execution Loop'
-
-🏎️  Deploying Cycle 1 tracks simultaneously across independent worktrees...
-🌲 [Worktree] Creating isolated branch 'sentinel/track_alpha'...
-🌲 [Worktree] Creating isolated branch 'sentinel/track_beta'...
-📝 [TRACK_ALPHA] Applying patch at command.go...
-📝 [TRACK_BETA] Applying patch at command.go...
-⚡ [Matrix:TRACK_ALPHA] Launching parallel Go check suite execution...
-⚡ [Matrix:TRACK_BETA] Launching parallel Go check suite execution...
-  ✅ Branch 'sentinel/track_alpha' saved to main repo — ready to push.
-
-🏁 --- CONCURRENT CONFLICT EVALUATION RUNTIME METRICS ---
-Result Vector -> Track: TRACK_ALPHA | Status: 🟩 PASSED ALL VERIFICATIONS
-Result Vector -> Track: TRACK_BETA | Status: 🟩 PASSED ALL VERIFICATIONS
-
-🏆 Winning Branch Verified: sentinel/track_alpha
-📝 Generating pull request title and body with Gemini 2.5 Pro...
-
-======================================================================
-📋  GENERATED PULL REQUEST
-======================================================================
-🏷️  TITLE: fix(cobra): propagate parent context to child commands
-🌿  BRANCH: sentinel/track_alpha
-📝  BODY: ...
-======================================================================
-
-🚀 Pushing branch 'sentinel/track_alpha' to your-github-username/cobra ...
-✅ Branch pushed successfully.
-📬 Opening PR: your-username:sentinel/track_alpha → spf13/cobra:main
-✅ PR opened: https://github.com/spf13/cobra/pull/XXXX
-
-======================================================================
-🏁  SENTINEL ENGINE — RUN COMPLETE
-======================================================================
-
-  📁  Upstream repo  : spf13/cobra
-  🍴  Your fork      : your-github-username/cobra
-  🔖  Issue fixed    : #2194  →  https://github.com/spf13/cobra/issues/2194
-  🌿  Branch         : sentinel/track_alpha
-  📄  File patched   : command.go
-  🏷️   PR title       : fix(cobra): propagate parent context to child commands
-
-  ✅  Pull request opened successfully!
-  🔗  https://github.com/spf13/cobra/pull/XXXX
-
-  ── Inspect the patch locally ─────────────────────────────
-  $ cd .../cobra
-  $ git log sentinel/track_alpha --oneline -3
-  $ git diff HEAD~1 HEAD
-
-======================================================================
+PR opened: https://github.com/spf13/cobra/pull/XXXX
 ```
 
-### Offline / Development Mode
-
-If you want to test the engine without making real GitHub API calls or forking actual repos, set:
+### Mock mode
 
 ```env
 SENTINEL_USE_MOCK_REPO=true
 ```
 
-This seeds a local minimal Go repository with a known bug (division by zero without a zero-check) and runs the full pipeline against it. Useful for verifying the engine works before spending API quota.
+Skips fork/clone and seeds a minimal local Go repo with a division-by-zero bug. Still requires `GEMINI_API_KEY`, `GITHUB_PERSONAL_ACCESS_TOKEN`, and `GITHUB_ISSUE_URL` in `.env`.
 
 ---
 
 ## Understanding the Output
 
-### The two tracks (ALPHA and BETA)
-
-The engine always generates and tests two fix hypotheses in parallel. This is intentional — different engineers often have different valid approaches to the same bug. By racing two strategies, the engine:
-- Has a higher chance of at least one passing tests on the first cycle
-- Can compare approaches and select the one that passes
-- Uses the ALPHA track's result if both pass (ALPHA is always preferred)
-
-### The Self-Healing Loop
-
-If both tracks fail, you will see:
-```
-🚨 Cycle 1 Failed. Intercepting diagnostic logs for Self-Healing loop...
-🏎️  Deploying Cycle 2 (Healed Track Run) concurrently...
-```
-
-This means Gemini's first attempt at the code had issues (syntax errors, logic mistakes, type mismatches). The engine captures the exact `go vet` or `go test` error output and feeds it back to Gemini 2.5 Flash with the previous attempt, asking for a targeted correction. Cycle 2 is another parallel run with this corrected code.
-
-### If all tracks fail
+### Admission rejected
 
 ```
-❌ System Regression: All parallel self-healing tracks exhausted.
+ADMISSION REJECTED: <reason>
+Exiting early — no planning or patching will run.
 ```
 
-This means even after self-healing, no valid fix was found. This typically happens with complex bugs that require deeper architectural changes than a surgical line-range patch can address. In this case, choose a simpler, more isolated issue and try again.
+The issue is unsuitable for this engine. Pick a different bug-fix issue.
 
-### The SQLite cache
+### Small vs medium tracks
 
-After the first run, you'll see a `.cache/` directory appear with `state_cache.db`. On subsequent runs against the same repo at the same Git commit:
+- **Small bugs** run a single `TRACK_ALPHA` — one hypothesis, one patch, lower cost
+- **Medium bugs** run `TRACK_ALPHA` and `TRACK_BETA` in parallel — two different strategies; if both pass, ALPHA wins
+
+### All tracks exhausted
+
 ```
-⚡ Index Cache Hit! Codebase map loaded instantly from local storage.
+System Regression: All tracks and replans exhausted.
+LLM calls used: 8/10
 ```
-This makes re-runs significantly faster since the Go AST parsing step is skipped.
+
+No valid fix was found within the budget. Try a simpler issue or one with a clearer stack trace.
+
+### SQLite cache
+
+Indexed per `(repo_name, git_commit_hash)`. On cache hit:
+
+```
+Index Cache Hit! Codebase map loaded instantly from local storage.
+```
+
+Pull new upstream commits to trigger a re-index.
 
 ---
 
 ## Cost Per Run
 
-Each full run makes approximately **5 Gemini API calls**:
+Approximate Gemini API usage:
 
-| Call | Model | Purpose |
-|------|-------|---------|
-| 1 | gemini-2.5-pro | Issue triage → structured JSON |
-| 2 | gemini-2.5-pro | Fix planning → 2 hypotheses |
-| 3 | gemini-2.5-flash | Code generation for TRACK_ALPHA |
-| 4 | gemini-2.5-flash | Code generation for TRACK_BETA |
-| 5 | gemini-2.5-pro | PR title + body generation |
+| Scenario | LLM calls | ~Cost |
+|----------|-----------|-------|
+| Rejected at admission gate | 1 (triage only) | ~$0.05 |
+| Small bug, first-try success | 5–6 | ~$0.30 |
+| Small bug with micro-heal + replan | up to 10 (cap) | ~$0.50 |
+| Medium bug, dual track success | 6–8 | ~$0.35 |
+| Medium bug, full recovery | up to 14 (cap) | ~$0.65 |
 
-If Cycle 2 (Self-Healing) triggers, 2 additional Flash calls are made (one per track).
-
-**Estimated cost per run: ~₹25–35 (~$0.30–0.40 USD)**
-
-The Pro calls dominate cost since triage and planning involve large prompts with full issue context and symbol data. The Flash calls for code generation are fast and cheap.
-
-> The free tier of the Gemini API (Google AI Studio) includes enough quota for several test runs. For production use, billing must be enabled on your Google Cloud project.
+Pro calls (triage, planning, replan, PR, escalation) dominate cost. Flash calls (code gen, heal) are cheap and parallelizable.
 
 ---
 
 ## Design Decisions
 
-### Why Git Worktrees instead of Docker?
+**Git worktrees over Docker** — Isolated directories in milliseconds, no daemon, native `go test` on the host.
 
-Docker containers take 2–10 seconds to spin up, require the Docker daemon, and add significant complexity. Git Worktrees create an isolated directory in under 50ms with zero extra tooling. Since we're testing Go code (which compiles natively), native Worktrees are the right tool.
+**SQLite over vectors** — Bug fixes need exact file paths and line numbers, not semantic similarity. A regex-based Go symbol parser + SQLite gives precise `resolve_symbol()` lookups.
 
-### Why SQLite instead of a vector database?
+**Pydantic schemas on every LLM call** — Gemini `response_schema` guarantees parseable JSON for triage, blueprints, and PR drafts.
 
-Vector databases (Pinecone, Chroma, etc.) do semantic similarity search. For this use case, we don't need semantic search — we need exact file paths and line numbers. A lexical Go AST parser gives us precise symbol boundaries that a vector embedding cannot. SQLite is a single file, has zero network dependencies, and is instant on cache hit.
+**Admission gate before planning** — Rejects features and ambiguous issues for ~$0.05 instead of spending $0.30+ on a doomed patch attempt.
 
-### Why Pydantic schemas for all LLM outputs?
+**Symbol anchoring + verify-after-patch** — Re-resolving line numbers before each patch and running `go build` after each edit prevents cascading failures from stale planner coordinates.
 
-Free-form LLM text output is unpredictable — the model might wrap JSON in markdown, add explanations, or change field names. By enforcing a Pydantic schema via the Gemini API's `response_schema` parameter, the output is guaranteed to have the expected structure. This eliminates an entire class of parsing errors.
+**Tiered execution** — Small bugs get depth (more heal attempts, focused single track). Medium bugs get breadth (two parallel tracks, two files max).
 
-### Why two fix hypotheses in parallel?
-
-A single hypothesis creates a binary outcome: it works or it doesn't. Two parallel hypotheses mean that even if the first strategy is wrong, the second may succeed — doubling the first-pass success rate with only a marginal increase in cost (Flash calls are cheap).
-
-### Why gemini-2.5-pro for planning and gemini-2.5-flash for code generation?
-
-Planning requires deep multi-step reasoning: parse the bug report, correlate it with symbol data, and produce precise line-number targets. This is exactly what Pro is built for. Code generation is a targeted, constrained task with a small context window — Flash handles it faster and cheaper.
-
----
-
-## Supported Repositories
-
-The engine is designed for and tested against these repositories:
-
-| Repository | URL | Notes |
-|-----------|-----|-------|
-| `spf13/cobra` | https://github.com/spf13/cobra | CLI framework |
-| `gin-gonic/gin` | https://github.com/gin-gonic/gin | HTTP web framework |
-| `go-playground/validator` | https://github.com/go-playground/validator | Struct validation |
-| `golangci/golangci-lint` | https://github.com/golangci/golangci-lint | Linter runner |
-
-Any Go repository will technically work since the AST indexer uses raw regex parsing, not import-specific tooling. However, the four repositories above are the ones the engine was built and validated against.
+**Baseline-aware tests** — Upstream repos often have pre-existing test flakes. The tester stashes the patch, records baseline failures, and only flags new failures.
 
 ---
 
 ## Troubleshooting
 
-### `❌ Missing system dependencies: go`
-Go is not in your PATH. Install Go from https://go.dev/dl/ and restart your terminal.
+### `Missing system dependencies: go`
+Install Go from https://go.dev/dl/ and restart your terminal.
 
-### `❌ Clone failed: Repository not found`
-Check that your GitHub token has `repo` scope. Go to https://github.com/settings/tokens and verify.
+### `ADMISSION REJECTED: Anchor symbol 'X' not found`
+The triage model guessed a wrong symbol name. Issues that cite exact file + line numbers (e.g. `command.go at lines 1111`) work best. The engine attempts to resolve symbols from line hints in the issue body.
 
-### `❌ Parsing Failure: Model output could not be parsed`
-Gemini returned malformed JSON. This is rare with the Pydantic schema enforcement. Re-run the engine — it typically resolves on retry.
+### `Missing credentials in .env`
+All three variables are required: `GEMINI_API_KEY`, `GITHUB_PERSONAL_ACCESS_TOKEN`, `GITHUB_ISSUE_URL`.
 
-### `⚠️ git pull returned non-zero (local changes present?)`
-Your local fork clone has uncommitted changes from a previous run. This is non-fatal — the engine continues with the existing state. To clean it up manually:
+### `Clone failed: Repository not found`
+Verify your GitHub token has the `repo` scope.
+
+### `Parsing Failure: malformed JSON`
+Rare with schema enforcement. Re-run; lower temperature is already set.
+
+### `Branch transfer failed` (but PR still opened)
+The patch committed inside the worktree but local branch fetch had a transient issue. If push succeeded and the PR URL printed, the run succeeded.
+
+### Stale local fork after a previous run
+
 ```bash
-cd cobra  # or whichever repo
+cd cobra   # or your repo directory
 git checkout .
 git clean -fd
+git pull origin main
 ```
 
-### `❌ Failed to open PR: Validation Failed`
-GitHub rejected the PR. Common causes:
-- A PR for this branch already exists (check your fork on GitHub)
-- The branch name contains characters GitHub doesn't accept
+### SQLite cache after pulling new commits
 
-### The engine seems to hang after "Waiting for fork to initialise"
-GitHub occasionally takes longer than 60 seconds for large repos. The engine will print a warning and proceed anyway. If the clone then fails, wait 30 seconds and re-run.
-
-### SQLite cache is stale after switching issues
-The cache is keyed by `(repo_name, git_commit_hash)`. If you switch to a different issue on the same repo without pulling new commits, the same cache is reused — this is correct behaviour. If you've pulled new commits, the cache auto-refreshes.
+The cache keys on commit hash. A new commit triggers automatic re-indexing on the next run.
 
 ---
 
-*Built with Python & Google Gemini. Zero extra dependencies. One command to go from issue URL to Pull Request.*
+*Python + Google Gemini. One command from issue URL to Pull Request.*

@@ -986,6 +986,7 @@ class SentinelPipeline:
             self.indexer,
             self.repo_name,
             issue_title=triage_data.get("raw_title", ""),
+            issue_body=triage_data.get("raw_body", ""),
         )
         complexity = (analysis.get("complexity") or "out_of_scope").lower()
         self._complexity = complexity if complexity in ("small", "medium") else "medium"

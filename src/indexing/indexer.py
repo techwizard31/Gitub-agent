@@ -237,3 +237,36 @@ class RepositoryIndexer:
         if not rows:
             return None
         return (rows[0]["start_line"], rows[0]["end_line"])
+
+    def resolve_symbol_at_line(
+        self, repo_name: str, file_path: str, line: int
+    ) -> tuple[str, int, int] | None:
+        """Returns (symbol_name, start_line, end_line) for the symbol enclosing line."""
+        if not file_path or line < 1:
+            return None
+
+        norm_path = file_path.replace("\\", "/")
+        base = os.path.basename(norm_path)
+
+        def _query(path_clause: str, path_arg: str) -> list:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute(f"""
+                    SELECT symbol_name, start_line, end_line, symbol_type
+                    FROM repo_symbols
+                    WHERE repo_name = ? AND {path_clause}
+                    AND symbol_type IN ('function', 'method')
+                    AND start_line <= ? AND end_line >= ?
+                    ORDER BY (end_line - start_line), start_line
+                """, (repo_name, path_arg, line, line))
+                return cursor.fetchall()
+
+        rows = _query("file_path = ?", norm_path)
+        if not rows:
+            rows = _query("file_path LIKE ?", f"%{base}")
+
+        if not rows:
+            return None
+        row = rows[0]
+        return (row["symbol_name"], row["start_line"], row["end_line"])

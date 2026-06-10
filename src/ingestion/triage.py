@@ -132,6 +132,34 @@ def _repo_has_go_files(repo_path: str) -> bool:
     return False
 
 
+def _normalize_anchor_name(anchor: str) -> str:
+    """Strip type qualifiers — 'Command.ExecuteC' → 'ExecuteC'."""
+    anchor = (anchor or "").strip()
+    if "." in anchor:
+        anchor = anchor.rsplit(".", 1)[-1]
+    return anchor
+
+
+def _extract_file_line_hint(text: str) -> tuple[str, int] | None:
+    """Parse 'command.go at lines 1111' or 'command.go#L1111' from issue text."""
+    if not text:
+        return None
+    patterns = [
+        r"([\w./\\-]+\.go)\s+at\s+lines?\s+(\d+)",
+        r"([\w./\\-]+\.go)#L(\d+)",
+        r"([\w./\\-]+\.go):(\d+):\d+",
+        r"lines?\s+(\d+)[^\n]*\n[^\n]*([\w./\\-]+\.go)",
+    ]
+    for i, pat in enumerate(patterns):
+        m = re.search(pat, text, re.IGNORECASE)
+        if not m:
+            continue
+        if i == 3:
+            return (os.path.basename(m.group(2)), int(m.group(1)))
+        return (os.path.basename(m.group(1)), int(m.group(2)))
+    return None
+
+
 def _title_suggests_non_bug(title: str) -> str | None:
     """Reject feature/proposal issues from title prefixes."""
     t = (title or "").strip().lower()
@@ -148,6 +176,7 @@ def run_admission_checks(
     indexer,
     repo_name: str,
     issue_title: str = "",
+    issue_body: str = "",
 ) -> dict:
     """
     Code-level pre-flight after LLM triage + repo index.
@@ -229,27 +258,57 @@ def run_admission_checks(
             analysis["reject_reason"] = f"Target file not found in repo: {target_file}"
             return analysis
 
-    anchor = (analysis.get("anchor_symbol") or "").strip()
+    anchor = _normalize_anchor_name(analysis.get("anchor_symbol") or "")
     if anchor:
-        bounds = None
-        if target_file:
-            bounds = indexer.resolve_symbol(repo_name, target_file, anchor)
-        if not bounds:
-            matches = [
-                m for m in indexer.lookup_symbol(repo_name, anchor)
-                if m.get("symbol_name") == anchor
-            ]
-            if matches:
-                best = matches[0]
-                analysis["target_file"] = best["file_path"]
-                target_file = best["file_path"]
-                bounds = (best["start_line"], best["end_line"])
-        if not bounds:
-            analysis["admitted"] = False
-            analysis["reject_reason"] = (
-                f"Anchor symbol '{anchor}' not found in repository index."
+        analysis["anchor_symbol"] = anchor
+
+    bounds = None
+    if anchor and target_file:
+        bounds = indexer.resolve_symbol(repo_name, target_file, anchor)
+    if not bounds and anchor:
+        matches = [
+            m for m in indexer.lookup_symbol(repo_name, anchor)
+            if m.get("symbol_name") == anchor
+        ]
+        if matches:
+            best = matches[0]
+            analysis["target_file"] = best["file_path"]
+            target_file = best["file_path"]
+            bounds = (best["start_line"], best["end_line"])
+
+    if not bounds:
+        hint_text = " ".join([
+            str(issue_body or ""),
+            str(analysis.get("reproduction_steps", "")),
+            str(analysis.get("target_file", "")),
+            " ".join(analysis.get("potential_files", [])),
+        ])
+        hint = _extract_file_line_hint(hint_text)
+        if hint:
+            hint_file, hint_line = hint
+            if not target_file:
+                target_file = hint_file
+                analysis["target_file"] = hint_file
+            resolved = indexer.resolve_symbol_at_line(
+                repo_name, target_file or hint_file, hint_line
             )
-            return analysis
+            if resolved:
+                sym_name, start, end = resolved
+                analysis["anchor_symbol"] = sym_name
+                analysis["target_file"] = target_file or hint_file
+                anchor = sym_name
+                bounds = (start, end)
+                print(
+                    f"   ↳ Resolved anchor from line hint: {sym_name} "
+                    f"in {analysis['target_file']} ({start}-{end})"
+                )
+
+    if anchor and not bounds:
+        analysis["admitted"] = False
+        analysis["reject_reason"] = (
+            f"Anchor symbol '{anchor}' not found in repository index."
+        )
+        return analysis
 
     if not analysis.get("has_clear_repro") and complexity == "small":
         analysis["admitted"] = False
@@ -299,6 +358,9 @@ ISSUE BODY:
 Set admitted=True ONLY if this is a small or medium bug fix in existing code.
 Set admitted=False with a clear reject_reason for features, proposals, security,
 architecture, or unclear maintainer decisions.
+
+anchor_symbol must be the bare Go function/method name (e.g. 'ExecuteC'), NOT qualified
+names like 'Command.ExecuteC'. target_file should be the relative path (e.g. 'command.go').
 """
 
         response = self.client.models.generate_content(
@@ -316,6 +378,7 @@ architecture, or unclear maintainer decisions.
         return {
             "meta": meta,
             "raw_title": title,
+            "raw_body": body,
             "labels": labels,
             "analysis": analysis_result,
         }
