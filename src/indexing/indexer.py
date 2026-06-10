@@ -183,3 +183,57 @@ class RepositoryIndexer:
             """, (repo_name, f"%{symbol_name}%"))
             
             return [dict(row) for row in cursor.fetchall()]
+
+    def resolve_symbol(
+        self, repo_name: str, file_path: str, symbol_name: str
+    ) -> tuple[int, int] | None:
+        """
+        Returns fresh (start_line, end_line) for an exact symbol in a specific file.
+        Prefers function/method symbols over struct/interface when names collide.
+        """
+        if not symbol_name or not file_path:
+            return None
+
+        norm_path = file_path.replace("\\", "/")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT start_line, end_line, symbol_type
+                FROM repo_symbols
+                WHERE repo_name = ? AND file_path = ? AND symbol_name = ?
+                ORDER BY
+                    CASE symbol_type
+                        WHEN 'method' THEN 0
+                        WHEN 'function' THEN 1
+                        WHEN 'struct' THEN 2
+                        ELSE 3
+                    END,
+                    start_line
+            """, (repo_name, norm_path, symbol_name))
+            rows = cursor.fetchall()
+
+        if not rows:
+            # Fallback: basename path match (planner may omit directory prefix)
+            base = os.path.basename(norm_path)
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT start_line, end_line, symbol_type
+                    FROM repo_symbols
+                    WHERE repo_name = ? AND file_path LIKE ? AND symbol_name = ?
+                    ORDER BY
+                        CASE symbol_type
+                            WHEN 'method' THEN 0
+                            WHEN 'function' THEN 1
+                            WHEN 'struct' THEN 2
+                            ELSE 3
+                        END,
+                        start_line
+                """, (repo_name, f"%{base}", symbol_name))
+                rows = cursor.fetchall()
+
+        if not rows:
+            return None
+        return (rows[0]["start_line"], rows[0]["end_line"])

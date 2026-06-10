@@ -147,3 +147,22 @@ class AgentComputerInterface:
             return "SYNTAX PASS: Code syntactic structures verified."
         except Exception as e:
             return f"Pre-verification engine exception: {e}"
+
+    def run_package_build(self, file_path: str) -> str:
+        """Runs go build on the package directory containing file_path."""
+        try:
+            safe_path = self._resolve_safe_path(file_path)
+            pkg_dir = os.path.dirname(safe_path) or "."
+            result = subprocess.run(
+                ["go", "build", "-o", os.devnull, "."],
+                capture_output=True,
+                text=True,
+                cwd=os.path.join(self.base_path, pkg_dir),
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "build failed").strip()
+                err = err.replace(safe_path, os.path.basename(file_path))
+                return f"BUILD FAIL:\n{err}"
+            return "BUILD PASS: Package compiles."
+        except Exception as e:
+            return f"Build verification exception: {e}"

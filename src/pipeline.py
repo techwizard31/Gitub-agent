@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-from ingestion.triage import IssueTriageEngine
+from ingestion.triage import IssueTriageEngine, run_admission_checks
 from ingestion.pr_generator import PRGenerator
 from indexing.indexer import RepositoryIndexer
 from aci.tools import AgentComputerInterface
@@ -19,6 +19,12 @@ from github_client import GitHubClient
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
+LLM_CAP_SMALL = 10
+LLM_CAP_MEDIUM = 14
+MICRO_HEAL_FLASH_SMALL = 3
+MICRO_HEAL_FLASH_MEDIUM = 2
+
+
 class FilePatch(BaseModel):
     """One atomic file change — one entry in a multi-file patch set."""
     target_file: str = Field(
@@ -26,14 +32,13 @@ class FilePatch(BaseModel):
     )
     start_line: int = Field(description="First line of the region to operate on.")
     end_line: int = Field(description="Last line of the region to operate on.")
+    anchor_symbol: str = Field(
+        default="",
+        description="Function/method name to re-resolve from SQLite before applying.",
+    )
     patch_mode: str = Field(
         default="replace",
-        description=(
-            "'replace': overwrite lines start_line..end_line with new_code. "
-            "Use for bug fixes that modify existing logic. "
-            "'insert_after': insert new_code AFTER line end_line without removing anything. "
-            "Use for enhancements: new functions, new map entries, new validator registrations."
-        )
+        description="'replace' only for bug fixes — overwrite lines start_line..end_line.",
     )
     description: str = Field(
         description="One-line human-readable description of what this file change does."
@@ -60,7 +65,7 @@ class FixHypothesis(BaseModel):
 
 class StrategyBlueprint(BaseModel):
     hypotheses: list[FixHypothesis] = Field(
-        description="Exactly 2 distinct fix strategies to evaluate concurrently."
+        description="1 or 2 distinct fix strategies (1 for small bugs, 2 for medium)."
     )
 
 
@@ -148,6 +153,47 @@ def _validate_and_correct_patches(patches: list[dict], repo_path: str) -> list[d
         if not found:
             print("   ↳ Dropping patch — file not found: '" + target + "'")
     return good
+
+
+def _coalesce_replace_per_file(patches: list[dict]) -> list[dict]:
+    """Keep at most one replace patch per file — prevents stale line drift."""
+    seen_replace: set[str] = set()
+    result = []
+    for p in patches:
+        mode = p.get("patch_mode", "replace")
+        fname = p.get("target_file", "")
+        if mode == "replace" and fname in seen_replace:
+            print("   ↳ Dropping duplicate replace on '" + fname + "'")
+            continue
+        if mode == "replace":
+            seen_replace.add(fname)
+        result.append(p)
+    return result
+
+
+def _enforce_bugfix_patches(patches: list[dict], complexity: str) -> list[dict]:
+    """Bug-fix mode: replace only, enforce file/patch count limits."""
+    cleaned = []
+    for p in patches:
+        if p.get("patch_mode", "replace") != "replace":
+            print("   ↳ Dropping insert_after patch (bug-fix mode): " + p.get("target_file", ""))
+            continue
+        cleaned.append(p)
+    cleaned = _coalesce_replace_per_file(cleaned)
+    max_files = 1 if complexity == "small" else 2
+    if len(cleaned) > max_files:
+        print("   ↳ Trimming to " + str(max_files) + " patch(es) for " + complexity + " tier")
+        cleaned = cleaned[:max_files]
+    return cleaned
+
+
+def _read_error_context(aci: "AgentComputerInterface", error_log: str, patch: "FilePatch") -> str:
+    """Reads ±5 lines around the compiler error line for precision healing."""
+    err_line = extract_error_line(error_log) or patch.end_line
+    err_file = extract_error_file(error_log) or patch.target_file
+    start = max(1, err_line - 5)
+    end = err_line + 5
+    return aci.view_file_range(err_file, start, end)
 
 
 def _find_nearest_pattern(file_content_lines: list, error_line: int, target_call: str) -> str:
@@ -348,27 +394,25 @@ def _expand_to_symbol_boundary(
     repo_name: str,
 ) -> tuple[int, int] | None:
     """
-    When the planner targets a suspiciously narrow line range (< 3 lines),
-    this finds the nearest enclosing function/method in the SQLite symbol index
-    and returns its (start_line, end_line) instead.
-
-    This prevents the LLM from being asked to replace a blank line or a
-    function signature without its body, which causes gofmt failures.
+    Expands narrow line ranges to enclosing symbol boundaries via the indexer.
     """
     target_line = patch.get("start_line", 0)
     target_file = patch.get("target_file", "")
-    if not target_file or not target_line:
+    anchor = patch.get("anchor_symbol", "")
+    if not target_file:
+        return None
+
+    if anchor:
+        bounds = indexer.resolve_symbol(repo_name, target_file, anchor)
+        if bounds:
+            return bounds
+
+    if not target_line:
         return None
 
     try:
-        # Walk the repo to find all symbols in the target file
         import sqlite3
-        db_path = os.path.join(repo_path, "..", ".cache", "state_cache.db")
-        db_path = os.path.normpath(db_path)
-        if not os.path.exists(db_path):
-            return None
-
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(indexer.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
@@ -382,14 +426,11 @@ def _expand_to_symbol_boundary(
         if not symbols:
             return None
 
-        # Find the symbol whose range contains target_line
         for start, end in symbols:
             if start <= target_line <= end:
                 return (start, end)
 
-        # No exact match — find the nearest symbol by proximity
-        nearest = min(symbols, key=lambda s: abs(s[0] - target_line))
-        return nearest
+        return min(symbols, key=lambda s: abs(s[0] - target_line))
 
     except Exception:
         return None
@@ -419,6 +460,54 @@ class SentinelPipeline:
         self.fork_username  = fork_username
         self._issue_number: int | None = None
         self._run_ts: int = int(time.time())  # fixed at start — unique per re-run
+        self._llm_calls: int = 0
+        self._complexity: str = "medium"
+        self._failure_memory: list[dict] = []
+
+    def _llm_generate(self, model: str, contents: str, config=None):
+        """Tracks LLM call budget; raises when cap exceeded."""
+        cap = LLM_CAP_SMALL if self._complexity == "small" else LLM_CAP_MEDIUM
+        if self._llm_calls >= cap:
+            raise RuntimeError("LLM call budget exhausted (" + str(cap) + " calls)")
+        self._llm_calls += 1
+        if config:
+            return self.client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        return self.client.models.generate_content(model=model, contents=contents)
+
+    def _reanchor_patch(self, patch: FilePatch) -> FilePatch:
+        """Re-resolve line numbers from SQLite before applying a patch."""
+        anchor = (patch.anchor_symbol or "").strip()
+        if not anchor:
+            return patch
+        bounds = self.indexer.resolve_symbol(
+            self.repo_name, patch.target_file, anchor
+        )
+        if bounds:
+            return patch.model_copy(update={
+                "start_line": bounds[0],
+                "end_line": bounds[1],
+            })
+        return patch
+
+    def _verify_patch(self, patch: FilePatch, aci: AgentComputerInterface) -> tuple[bool, str]:
+        """gofmt + go build on the changed package."""
+        syntax = aci.run_local_syntax_check(patch.target_file)
+        if "FAIL" in syntax:
+            return False, syntax
+        build = aci.run_package_build(patch.target_file)
+        if "FAIL" in build:
+            return False, build
+        return True, "Patch verified (gofmt + build)."
+
+    def _revert_files(self, wt_workspace: str, files: list[str]):
+        """Restore touched files after unhealable patch failure."""
+        for fpath in files:
+            subprocess.run(
+                ["git", "checkout", "--", fpath],
+                cwd=wt_workspace, capture_output=True, text=True,
+            )
 
     # ── Branch commit + transfer ──────────────────────────────────────────────
 
@@ -570,6 +659,7 @@ class SentinelPipeline:
         retry_bad_code: str = "",
         retry_error_log: str = "",
         all_patches: list | None = None,
+        use_pro: bool = False,
     ) -> tuple[bool, str, str]:
         """
         Generates and applies one FilePatch.
@@ -586,12 +676,8 @@ class SentinelPipeline:
         )
 
         if not retry_error_log:
-            # Cycle 1: fresh generation
             task = (
-                "PATCH MODE: INSERT — insert NEW code AFTER line "
-                + str(patch.end_line) + ". Do NOT reproduce existing lines."
-                if patch.patch_mode == "insert_after"
-                else "PATCH MODE: REPLACE — write the complete replacement for lines "
+                "PATCH MODE: REPLACE — write the complete replacement for lines "
                 + str(patch.start_line) + " to " + str(patch.end_line) + "."
             )
             prompt = (
@@ -609,7 +695,7 @@ class SentinelPipeline:
                 "- Output must pass gofmt with zero errors."
             )
         else:
-            # Cycle 2: structured self-healing
+            err_ctx = _read_error_context(aci, retry_error_log, patch)
             prompt = self._build_heal_prompt(
                 patch=patch,
                 bad_code=retry_bad_code,
@@ -617,24 +703,67 @@ class SentinelPipeline:
                 aci=aci,
                 all_patches=all_patches,
             )
+            prompt += "\n\nERROR CONTEXT (lines around failure):\n" + err_ctx
 
-        gen_res = self.client.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt
-        )
+        model = "gemini-2.5-pro" if use_pro else "gemini-2.5-flash"
+        gen_res = self._llm_generate(model=model, contents=prompt)
         raw_text = gen_res.text if gen_res and gen_res.text else ""
         code_written = clean_llm_code_output(raw_text)
         if not code_written:
             return False, "LLM returned empty response — cannot apply patch.", ""
 
-        if patch.patch_mode == "insert_after":
-            result = aci.insert_after_line(patch.target_file, patch.end_line, code_written)
-        else:
-            result = aci.apply_code_patch(
-                patch.target_file, patch.start_line, patch.end_line, code_written
-            )
+        result = aci.apply_code_patch(
+            patch.target_file, patch.start_line, patch.end_line, code_written
+        )
 
         success = "⚠️" not in result
         return success, result, code_written
+
+    async def _apply_patch_with_micro_heal(
+        self,
+        patch: FilePatch,
+        aci: AgentComputerInterface,
+        track_id: str,
+        all_patches: list[FilePatch] | None = None,
+    ) -> tuple[bool, str, str]:
+        """
+        Apply one patch with inline micro-heal: up to N Flash attempts,
+        then optional Pro escalation for small bugs.
+        """
+        flash_limit = (
+            MICRO_HEAL_FLASH_SMALL
+            if self._complexity == "small"
+            else MICRO_HEAL_FLASH_MEDIUM
+        )
+        bad_code = ""
+        error_log = ""
+        last_msg = ""
+
+        for attempt in range(flash_limit + 1):
+            use_pro = attempt == flash_limit
+
+            ok, msg, code = await self._apply_single_patch(
+                patch, aci, track_id,
+                retry_bad_code=bad_code,
+                retry_error_log=error_log,
+                all_patches=all_patches,
+                use_pro=use_pro,
+            )
+            bad_code = code
+            last_msg = msg
+
+            if not ok:
+                error_log = msg
+                continue
+
+            verified, verify_msg = self._verify_patch(patch, aci)
+            if verified:
+                return True, msg, code
+
+            error_log = verify_msg
+            bad_code = code
+
+        return False, last_msg or error_log, bad_code
 
     # ── Core track executor ───────────────────────────────────────────────────
 
@@ -642,81 +771,64 @@ class SentinelPipeline:
         self,
         track_id: str,
         hypothesis: FixHypothesis,
-        retry_context: dict | None = None,
+        cycle: int = 1,
     ) -> dict:
         """
-        Runs one complete hypothesis track:
-        1. Fresh Git Worktree on a collision-free branch
-        2. Apply ALL patches sequentially (continue even if one fails — collect all bad_codes)
-        3. go vet + go test across the entire worktree
-        4. If all pass: commit every changed file and transfer branch to main repo
-
-        retry_context (Cycle 2):
-          - error_log:  full diagnostics from Cycle 1 (go vet / gofmt)
-          - bad_codes:  dict[patch_index → broken code written in Cycle 1]
+        Runs one hypothesis track:
+        1. Git worktree on a unique branch
+        2. Re-anchor + apply patches sequentially with micro-heal
+        3. Stop and revert on first unhealable patch failure
+        4. Full go vet + go test if all patches pass
         """
-        cycle       = 2 if retry_context else 1
         branch_name = make_branch_name(self._issue_number, track_id, cycle, self._run_ts)
 
         wt_manager   = WorktreeManager(self.repo_path)
         wt_workspace = None
+        bad_codes: dict[int, str] = {}
+        touched_files: list[str] = []
 
         try:
             wt_workspace = wt_manager.create_hypothesis_worktree(track_id, branch_name)
             aci = AgentComputerInterface(base_workspace_path=wt_workspace)
 
-            all_patch_success = True
-            first_failure_msg = ""
-            bad_codes: dict[int, str] = {}
-            patch_errors: dict[int, str] = {}
-
-            for idx, patch in enumerate(hypothesis.patches):
+            for idx, raw_patch in enumerate(hypothesis.patches):
+                patch = self._reanchor_patch(raw_patch)
                 label = (
                     "[" + track_id + "][patch "
                     + str(idx + 1) + "/" + str(len(hypothesis.patches)) + "]"
                 )
-                print("📝 " + label + " Applying (" + patch.patch_mode + ") → " + patch.target_file)
-
-                # Every patch gets the full error log in Cycle 2 —
-                # cross-patch errors (undefined: X) require all patches to see the same diagnostic
-                retry_bad = (retry_context or {}).get("bad_codes", {}).get(idx, "")
-                # Use per-patch error if available — more precise than the global error_log
-                per_patch_errors = (retry_context or {}).get("patch_errors", {})
-                retry_err = (
-                    per_patch_errors.get(idx)
-                    or (retry_context or {}).get("error_log", "")
-                    or ""
+                sym = patch.anchor_symbol or "(no anchor)"
+                print(
+                    "📝 " + label + " → " + patch.target_file
+                    + " [" + sym + "] lines " + str(patch.start_line)
+                    + "-" + str(patch.end_line)
                 )
 
-                ok, msg, code = await self._apply_single_patch(
-                    patch, aci, track_id,
-                    retry_bad_code=retry_bad,
-                    retry_error_log=retry_err,
-                    all_patches=hypothesis.patches,
+                ok, msg, code = await self._apply_patch_with_micro_heal(
+                    patch, aci, track_id, all_patches=hypothesis.patches,
                 )
                 bad_codes[idx] = code
+                touched_files.append(patch.target_file)
 
                 if not ok:
-                    print("  ⚠️  Patch " + str(idx + 1) + " failed: " + msg[:120])
-                    if all_patch_success:
-                        first_failure_msg = msg
-                    all_patch_success = False
-                    # Store per-patch error so Cycle 2 gets the exact right error
-                    # for each patch, not a single global error applied to all
-                    patch_errors[idx] = msg
-                    # Do NOT break — keep applying remaining patches so all bad_codes
-                    # are collected, enabling full Cycle 2 self-healing context
-
-            if not all_patch_success:
-                return {
-                    "track_id":    track_id,
-                    "passed":      False,
-                    "diagnostics": first_failure_msg,
-                    "bad_codes":   bad_codes,
-                    "patch_errors": patch_errors,
-                    "branch":      branch_name,
-                    "hypothesis":  hypothesis,
-                }
+                    print("  ❌ Patch " + str(idx + 1) + " unhealable: " + msg[:150])
+                    self._revert_files(wt_workspace, touched_files)
+                    self._failure_memory.append({
+                        "track": track_id,
+                        "file": patch.target_file,
+                        "symbol": patch.anchor_symbol,
+                        "error": msg[:500],
+                        "code_attempted": code[:300] if code else "",
+                        "cycle": cycle,
+                    })
+                    return {
+                        "track_id": track_id,
+                        "passed": False,
+                        "diagnostics": msg,
+                        "bad_codes": bad_codes,
+                        "branch": branch_name,
+                        "hypothesis": hypothesis,
+                    }
 
             tester     = AsyncTestSuiteRunner(wt_workspace)
             matrix_res = await tester.execute_verification_matrix(track_id)
@@ -724,29 +836,133 @@ class SentinelPipeline:
             if matrix_res["passed"]:
                 self._commit_and_transfer_branch(wt_workspace, branch_name, hypothesis)
             else:
-                # Surface go vet/test output as the error_log for Cycle 2
-                # (cross-patch compile errors only appear here, not in per-patch gofmt)
-                first_failure_msg = matrix_res.get("diagnostics", "")
-                matrix_res["diagnostics"] = first_failure_msg
+                self._failure_memory.append({
+                    "track": track_id,
+                    "file": ", ".join(p.target_file for p in hypothesis.patches),
+                    "symbol": "",
+                    "error": matrix_res.get("diagnostics", "")[:500],
+                    "code_attempted": "",
+                    "cycle": cycle,
+                })
 
-            matrix_res["branch"]    = branch_name
+            matrix_res["branch"]     = branch_name
             matrix_res["hypothesis"] = hypothesis
-            matrix_res["bad_codes"] = bad_codes
+            matrix_res["bad_codes"]  = bad_codes
             return matrix_res
 
         except Exception as e:
             import traceback
+            if wt_workspace and touched_files:
+                self._revert_files(wt_workspace, touched_files)
             return {
-                "track_id":    track_id,
-                "passed":      False,
+                "track_id": track_id,
+                "passed": False,
                 "diagnostics": "Track Runtime Exception: " + str(e) + "\n" + traceback.format_exc(),
-                "bad_codes":   bad_codes if "bad_codes" in dir() else {},
-                "branch":      branch_name if "branch_name" in dir() else "unknown",
-                "hypothesis":  hypothesis,
+                "bad_codes": bad_codes,
+                "branch": branch_name,
+                "hypothesis": hypothesis,
             }
         finally:
             if wt_workspace and wt_manager:
                 wt_manager.cleanup_worktree(track_id)
+
+    def _build_planner_prompt(
+        self,
+        analysis: dict,
+        symbol_ctx: str,
+        file_inventory: str,
+        file_snippets: str,
+        num_hypotheses: int,
+        max_files: int,
+    ) -> str:
+        return (
+            "You are a Principal Go Software Engineer designing BUG FIX strategies.\n\n"
+            "ISSUE SYMPTOM: " + str(analysis.get("symptom")) + "\n"
+            "ANCHOR SYMBOL: " + str(analysis.get("anchor_symbol", "")) + "\n"
+            "TARGET FILE: " + str(analysis.get("target_file", "")) + "\n"
+            "REPRODUCTION NOTES: " + str(analysis.get("reproduction_steps")) + "\n\n"
+            "INDEXED SYMBOLS (file_path, symbol_name, start_line, end_line):\n"
+            + symbol_ctx + "\n\n"
+            "REAL FILES IN REPO (use ONLY these in target_file — never invent paths):\n"
+            + file_inventory + "\n\n"
+            + ("ACTUAL FILE CONTENT (use these line numbers for start_line/end_line):\n"
+               + file_snippets + "\n\n" if file_snippets else "")
+            + "SCHEMA: Each hypothesis has a 'patches' list. "
+            + "Output exactly " + str(num_hypotheses) + " hypothesis/hypotheses.\n\n"
+            "CRITICAL RULES (bug fix only):\n"
+            "1. target_file must be from REAL FILES list. Never invent paths.\n"
+            "2. Set anchor_symbol on every patch — the exact function/method to modify.\n"
+            "3. start_line/end_line MUST span the COMPLETE function or method body.\n"
+            "4. patch_mode MUST be 'replace' only — modify existing logic, never add new APIs.\n"
+            "5. Max " + str(max_files) + " file(s) per hypothesis. "
+            "Max 1 replace patch per file — never patch the same file twice.\n"
+            "6. For 2-file fixes: patch the callee/definition file first, caller second.\n"
+            "7. description must clearly state what this individual change does.\n"
+            "Output valid JSON."
+        )
+
+    def _replan(
+        self,
+        analysis: dict,
+        symbol_ctx: str,
+        file_inventory: str,
+        file_snippets: str,
+        num_hypotheses: int,
+        max_files: int,
+    ) -> list[dict] | None:
+        """Generate a new blueprint informed by FailureMemory."""
+        memory_text = json.dumps(self._failure_memory, indent=2)
+        prompt = (
+            self._build_planner_prompt(
+                analysis, symbol_ctx, file_inventory, file_snippets,
+                num_hypotheses, max_files,
+            )
+            + "\n\nPREVIOUS FAILED ATTEMPTS (do NOT repeat these approaches):\n"
+            + memory_text
+            + "\n\nOutput a DIFFERENT fix strategy than all previous attempts."
+        )
+        try:
+            response = self._llm_generate(
+                model="gemini-2.5-pro",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=StrategyBlueprint,
+                    temperature=0.3,
+                ),
+            )
+            blueprint = json.loads(response.text)
+            return blueprint.get("hypotheses", [])
+        except Exception as e:
+            print("  ⚠️  Replan failed: " + str(e))
+            return None
+
+    def _prepare_hypotheses(
+        self, hypotheses_raw: list[dict], complexity: str, analysis: dict
+    ) -> list[FixHypothesis]:
+        """Validate paths, expand symbols, enforce bug-fix limits."""
+        default_anchor = (analysis.get("anchor_symbol") or "").strip()
+        prepared = []
+        for h in hypotheses_raw:
+            h["patches"] = _validate_and_correct_patches(
+                h.get("patches", []), self.repo_path
+            )
+            h["patches"] = _enforce_bugfix_patches(h["patches"], complexity)
+            for p in h.get("patches", []):
+                if not p.get("anchor_symbol"):
+                    p["anchor_symbol"] = default_anchor
+                if p.get("patch_mode", "replace") == "replace":
+                    span = p.get("end_line", 0) - p.get("start_line", 0)
+                    if span < 3:
+                        expanded = _expand_to_symbol_boundary(
+                            p, self.repo_path, self.indexer, self.repo_name
+                        )
+                        if expanded:
+                            p["start_line"] = expanded[0]
+                            p["end_line"] = expanded[1]
+            if h.get("patches"):
+                prepared.append(FixHypothesis(**h))
+        return prepared
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
@@ -757,12 +973,39 @@ class SentinelPipeline:
         triage_data        = self.triage_engine.process_issue(issue_url)
         analysis           = triage_data["analysis"]
         self._issue_number = triage_data.get("meta", {}).get("issue_number")
+        self._llm_calls    = 1  # triage call
         print("🎯 Target Acquired: " + triage_data["raw_title"] + "\n")
 
-        # Phase 2: AST Symbol Index
+        # Phase 2: AST Symbol Index + Admission Gate
         self.indexer.index_repository(self.repo_path, self.repo_name)
 
+        run_admission_checks(
+            analysis,
+            triage_data.get("labels", []),
+            self.repo_path,
+            self.indexer,
+            self.repo_name,
+            issue_title=triage_data.get("raw_title", ""),
+        )
+        complexity = (analysis.get("complexity") or "out_of_scope").lower()
+        self._complexity = complexity if complexity in ("small", "medium") else "medium"
+
+        if not analysis.get("admitted"):
+            reason = analysis.get("reject_reason") or "Issue not admitted."
+            print("🚫 ADMISSION REJECTED: " + reason)
+            print("   Complexity: " + str(analysis.get("complexity", "unknown")))
+            print("   Exiting early — no planning or patching will run.")
+            return False
+
+        print(
+            "✅ Issue admitted as " + self._complexity.upper() + " bug "
+            "(confidence: " + str(analysis.get("confidence", "?")) + ")\n"
+        )
+
         search_terms = {self.repo_name, analysis.get("target_package", "")}
+        anchor = (analysis.get("anchor_symbol") or "").strip()
+        if anchor:
+            search_terms.add(anchor)
         for f in analysis.get("potential_files", []):
             base = os.path.splitext(os.path.basename(f))[0]
             if base:
@@ -782,58 +1025,41 @@ class SentinelPipeline:
         file_inventory = _build_file_inventory(self.repo_path)
         symbol_ctx = json.dumps(all_symbols[:10], indent=2) if all_symbols else "No symbols found."
 
-        # Phase 3: Strategy Planning
-        print("🤖 Generating multi-track fix blueprints with Gemini 2.5 Pro...")
-        # Build file snippets for the files most likely to need patching
-        # This shows the LLM actual code content so it can pick correct line ranges
+        # Build file snippets for planner context
         file_snippets = ""
-        snippet_files = list({
+        snippet_candidates = list({
             f for f in analysis.get("potential_files", [])
             if f and os.path.exists(os.path.join(self.repo_path, f))
-        })[:3]
-        for sf in snippet_files:
+        })
+        target_file = (analysis.get("target_file") or "").strip()
+        if target_file and target_file not in snippet_candidates:
+            snippet_candidates.insert(0, target_file)
+        for sf in snippet_candidates[:3]:
             try:
                 full = os.path.join(self.repo_path, sf)
                 with open(full, encoding="utf-8", errors="ignore") as fh:
                     lines = fh.readlines()
                 numbered = "".join(
                     str(i + 1).rjust(4) + " | " + l
-                    for i, l in enumerate(lines[:200])  # first 200 lines max
+                    for i, l in enumerate(lines[:200])
                 )
                 file_snippets += "\n--- " + sf + " (first 200 lines) ---\n" + numbered
             except Exception:
                 pass
 
-        planner_prompt = (
-            "You are a Principal Go Software Engineer designing fix strategies.\n\n"
-            "ISSUE SYMPTOM: " + str(analysis.get("symptom")) + "\n"
-            "REPRODUCTION NOTES: " + str(analysis.get("reproduction_steps")) + "\n\n"
-            "INDEXED SYMBOLS (file_path, symbol_name, start_line, end_line):\n"
-            + symbol_ctx + "\n\n"
-            "REAL FILES IN REPO (use ONLY these in target_file — never invent paths):\n"
-            + file_inventory + "\n\n"
-            + ("ACTUAL FILE CONTENT (use these line numbers for start_line/end_line):\n"
-               + file_snippets + "\n\n" if file_snippets else "")
-            + "SCHEMA: Each hypothesis has a 'patches' list — one FilePatch per file "
-            "that needs changing. Include ALL files required.\n\n"
-            "CRITICAL RULES:\n"
-            "1. target_file must be from REAL FILES list. Never invent paths.\n"
-            "2. start_line and end_line MUST span the COMPLETE function or block to change.\n"
-            "   Never target a blank line or a single line — always cover the entire\n"
-            "   function signature through its closing brace.\n"
-            "3. patch_mode:\n"
-            "   'replace' — modifying EXISTING logic (must cover full function body)\n"
-            "   'insert_after' — adding NEW code that doesn't exist yet\n"
-            "4. When adding a new validator, include at minimum:\n"
-            "   a) A patch that adds the validator FUNCTION\n"
-            "   b) A patch that adds the registration entry in the validator MAP\n"
-            "   Do NOT include patches for translation/documentation files — "
-            "those are optional and frequently cause syntax errors in CI.\n"
-            "5. description must clearly state what this individual change does.\n"
-            "Output valid JSON with exactly 2 hypotheses."
+        is_small = self._complexity == "small"
+        num_hypotheses = 1 if is_small else 2
+        max_files = 1 if is_small else 2
+        max_replans = 1 if is_small else 2
+
+        # Phase 3: Strategy Planning
+        print("🤖 Generating fix blueprint(s) with Gemini 2.5 Pro...")
+        planner_prompt = self._build_planner_prompt(
+            analysis, symbol_ctx, file_inventory, file_snippets,
+            num_hypotheses, max_files,
         )
 
-        response = self.client.models.generate_content(
+        response = self._llm_generate(
             model="gemini-2.5-pro",
             contents=planner_prompt,
             config=types.GenerateContentConfig(
@@ -857,83 +1083,70 @@ class SentinelPipeline:
                 print("❌ Parsing Failure: no JSON in model output.")
                 return False
 
-        hypotheses_raw = blueprint.get("hypotheses", [])
-        if len(hypotheses_raw) < 2:
-            print("❌ Planning Error: fewer than 2 hypotheses returned.")
+        hypotheses_raw = blueprint.get("hypotheses", [])[:num_hypotheses]
+        if not hypotheses_raw:
+            print("❌ Planning Error: no hypotheses returned.")
             return False
 
-        for h in hypotheses_raw:
-            h["patches"] = _validate_and_correct_patches(h.get("patches", []), self.repo_path)
-            # Expand any suspiciously narrow line ranges — a patch covering fewer
-            # than 3 lines almost always means the planner targeted a blank line
-            # or only the function signature instead of the whole function body.
-            for p in h.get("patches", []):
-                if p.get("patch_mode", "replace") == "replace":
-                    span = p.get("end_line", 0) - p.get("start_line", 0)
-                    if span < 3:
-                        # Find the enclosing symbol from the index
-                        expanded = _expand_to_symbol_boundary(
-                            p, self.repo_path, self.indexer, self.repo_name
-                        )
-                        if expanded:
-                            p["start_line"] = expanded[0]
-                            p["end_line"]   = expanded[1]
-                            print("  📐 Expanded narrow patch range → lines "
-                                  + str(expanded[0]) + "-" + str(expanded[1])
-                                  + " in " + p.get("target_file", ""))
-
-        hypotheses_raw = [h for h in hypotheses_raw if h.get("patches")]
-        if len(hypotheses_raw) < 2:
-            print("❌ Planning Error: fewer than 2 valid hypotheses after path validation.")
+        prepared = self._prepare_hypotheses(hypotheses_raw, self._complexity, analysis)
+        if not prepared:
+            print("❌ Planning Error: no valid patches after validation.")
             return False
-        hypotheses_raw = hypotheses_raw[:2]
+        if is_small and any(len(h.patches) != 1 for h in prepared):
+            prepared = [
+                FixHypothesis(
+                    title=h.title,
+                    patches=h.patches[:1],
+                )
+                for h in prepared
+            ]
+        if not is_small and len(prepared) < 2:
+            print("❌ Planning Error: medium bug requires 2 hypotheses.")
+            return False
 
-        print(
-            "📊 Blueprint locked.\n"
-            "   Track ALPHA: '" + hypotheses_raw[0]["title"] + "' ("
-            + str(len(hypotheses_raw[0]["patches"])) + " file patch(es))\n"
-            "   Track BETA:  '" + hypotheses_raw[1]["title"] + "' ("
-            + str(len(hypotheses_raw[1]["patches"])) + " file patch(es))"
-        )
-
-        h_alpha = FixHypothesis(**hypotheses_raw[0])
-        h_beta  = FixHypothesis(**hypotheses_raw[1])
-
-        # Phase 4: Cycle 1 — Parallel Race
-        print("\n🏎️  Deploying Cycle 1 tracks simultaneously across independent worktrees...")
-        c1_results = await asyncio.gather(
-            self.execute_hypothesis_track("TRACK_ALPHA", h_alpha),
-            self.execute_hypothesis_track("TRACK_BETA",  h_beta),
-        )
-        winning_track = next((r for r in c1_results if r["passed"]), None)
-
-        # Phase 5: Cycle 2 — Structured Self-Healing
-        results = c1_results
-        if not winning_track:
-            print("\n🚨 Cycle 1 Failed. Launching Self-Healing Cycle 2...")
-            print("🏎️  Deploying Cycle 2 concurrently...")
-            c2_results = await asyncio.gather(
-                self.execute_hypothesis_track(
-                    "TRACK_ALPHA",
-                    FixHypothesis(**hypotheses_raw[0]),
-                    retry_context={
-                        "error_log":    c1_results[0]["diagnostics"],
-                        "bad_codes":    c1_results[0].get("bad_codes", {}),
-                        "patch_errors": c1_results[0].get("patch_errors", {}),
-                    },
-                ),
-                self.execute_hypothesis_track(
-                    "TRACK_BETA",
-                    FixHypothesis(**hypotheses_raw[1]),
-                    retry_context={
-                        "error_log":    c1_results[1]["diagnostics"],
-                        "bad_codes":    c1_results[1].get("bad_codes", {}),
-                        "patch_errors": c1_results[1].get("patch_errors", {}),
-                    },
-                ),
+        for i, h in enumerate(prepared):
+            track = "ALPHA" if i == 0 else "BETA"
+            print(
+                "   Track " + track + ": '" + h.title + "' ("
+                + str(len(h.patches)) + " patch(es))"
             )
-            results       = c2_results
-            winning_track = next((r for r in c2_results if r["passed"]), None)
+
+        winning_track = None
+        results: list[dict] = []
+        cycle = 1
+        max_cycles = 1 + max_replans
+
+        while cycle <= max_cycles and not winning_track:
+            if cycle > 1:
+                print("\n🔄 Replan cycle " + str(cycle) + " with FailureMemory...")
+                replanned = self._replan(
+                    analysis, symbol_ctx, file_inventory, file_snippets,
+                    num_hypotheses, max_files,
+                )
+                if not replanned:
+                    break
+                prepared = self._prepare_hypotheses(
+                    replanned, self._complexity, analysis
+                )
+                if not prepared:
+                    break
+
+            print(
+                "\n🏎️  Deploying cycle " + str(cycle)
+                + " track(s) across independent worktrees..."
+            )
+            if is_small:
+                results = [await self.execute_hypothesis_track(
+                    "TRACK_ALPHA", prepared[0], cycle=cycle,
+                )]
+            else:
+                results = list(await asyncio.gather(
+                    self.execute_hypothesis_track("TRACK_ALPHA", prepared[0], cycle=cycle),
+                    self.execute_hypothesis_track("TRACK_BETA", prepared[1], cycle=cycle),
+                ))
+
+            winning_track = next((r for r in results if r["passed"]), None)
+            cycle += 1
 
         # Phase 6: Results Summary
         print("\n🏁 --- CONCURRENT CONFLICT EVALUATION RUNTIME METRICS ---")
@@ -945,7 +1158,9 @@ class SentinelPipeline:
                 print("   ↳ Diagnostics: " + clean_diag[:200] + "...")
 
         if not winning_track:
-            print("\n❌ System Regression: All parallel self-healing tracks exhausted.")
+            print("\n❌ System Regression: All tracks and replans exhausted.")
+            print("   LLM calls used: " + str(self._llm_calls)
+                  + "/" + str(LLM_CAP_SMALL if is_small else LLM_CAP_MEDIUM))
             return False
 
         # Phase 7: PR Generation
